@@ -687,7 +687,6 @@ class SettingsPage:
 
         if account_index < len(accounts):
             accounts.pop(account_index)
-            self._rebuild_account_cards(module_name)
 
             # Update expansion title
             expansion = self._module_expansions.get(module_name)
@@ -697,7 +696,11 @@ class SettingsPage:
                     f'{ngettext("account", "accounts", len(accounts))})"'
                 )
 
+            # Notify BEFORE rebuilding: _rebuild_account_cards deletes the card
+            # that owns this delete button, which would invalidate the click
+            # handler's slot context and break ui.notify() afterwards.
             ui.notify(_("Account deleted"), type="positive")
+            self._rebuild_account_cards(module_name)
 
     def _rebuild_account_cards(self, module_name: str) -> None:
         """Rebuilds all account cards for a module from current edit settings.
@@ -804,12 +807,16 @@ class SettingsPage:
         for key, value in parsed.items():
             account_config[key] = value
 
-        self._rebuild_account_cards(module_name)
-        dialog.close()
+        # Notify and close BEFORE rebuilding: _rebuild_account_cards deletes the
+        # parent card that owns this dialog (created from the auto-fill button's
+        # slot), which would invalidate the click handler's slot context and
+        # break ui.notify() / dialog.close() afterwards.
         ui.notify(
             _("Auto-filled: {fields}").format(fields=", ".join(parsed.keys())),
             type="positive",
         )
+        dialog.close()
+        self._rebuild_account_cards(module_name)
 
     def _clear_module_session(self, module_name: str) -> None:
         """Clears session data for a module, forcing re-login.
