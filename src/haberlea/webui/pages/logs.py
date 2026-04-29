@@ -3,8 +3,7 @@
 from nicegui import ui
 
 from haberlea.i18n import _
-
-from ..state import clear_logs, get_app_storage
+from haberlea.webui.state import clear_logs, get_app_storage
 
 
 class LogsPage:
@@ -37,7 +36,7 @@ class LogsPage:
             return
 
         storage = get_app_storage()
-        logs = storage.get("logs", [])
+        logs = storage.logs
 
         for log_msg in logs:
             self.log_display.push(log_msg)

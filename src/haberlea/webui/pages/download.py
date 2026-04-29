@@ -1,58 +1,64 @@
-"""Download page for Haberlea WebUI."""
+"""Download page for Haberlea WebUI.
+
+The page is a thin view over ``download_service``: it subscribes to the
+service on render and receives snapshot pushes. All business state lives in
+the service so that browser refreshes and multiple tabs paint from the same
+source of truth.
+"""
+
+from __future__ import annotations
 
 import contextlib
-import traceback
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from nicegui import app, ui
+from nicegui import background_tasks, ui
 
-from haberlea.i18n import _
+from haberlea.i18n import _, ngettext
+from haberlea.utils.settings import SETTINGS_PATH, save_settings, settings
+from haberlea.webui import download_service
+from haberlea.webui.state import add_log
 
-from ...cli import resolve_urls_to_media
-from ...core import Haberlea, haberlea_core_download
-from ...download_queue import DownloadQueue
-from ...plugins.base import ExtensionBase
-from ...utils.models import (
-    MediaIdentification,
-    ModuleModes,
-)
-from ...utils.progress import ProgressEvent, clear_all, set_callback
-from ...utils.settings import _settings_path, save_settings, settings
-from ..state import add_log, get_app_storage
+if TYPE_CHECKING:
+    from nicegui import Client
 
-# Maximum number of tracks to display initially before showing "Show all" button
+    from haberlea.webui.download_service import JobSnapshot, ServiceSnapshot
+
+# Maximum number of tracks to display initially before the "Show all" button.
 MAX_VISIBLE_TRACKS = 50
 
 
 class DownloadPage:
-    """Download page component with job-based download queue display."""
+    """Download page — pure view over the module-level download service."""
 
     def __init__(self) -> None:
-        """Initialize download page."""
+        """Initialize download page UI references."""
         self.url_input: ui.textarea | None = None
         self.download_log: ui.log | None = None
-        self._is_downloading: bool = False
+        self.start_button: ui.button | None = None
 
-        # Job-based progress tracking
-        self._jobs: dict[str, dict[str, Any]] = {}
-        self._track_progress: dict[str, dict[str, Any]] = {}
+        self._client: Client | None = None
+        self._sub_id: int | None = None
 
-        # UI element references for updates
-        self._job_cards: dict[str, ui.card] = {}
-        self._job_progress_bars: dict[str, ui.linear_progress] = {}
-        self._job_status_labels: dict[str, ui.label] = {}
-        self._job_expansions: dict[str, ui.expansion] = {}
-        self._track_rows: dict[str, ui.row] = {}
-        self._track_progress_bars: dict[str, ui.linear_progress] = {}
+        # Coalescing state for snapshot push -> UI update.
+        self._latest: ServiceSnapshot | None = None
+        self._scheduled: bool = False
 
-        # Track "show all" state per job
+        # Log tail cursor so we only push new lines to the ui.log widget.
+        self._log_cursor: int = 0
+
+        # Per-client, view-only: which job expansions are "show all" tracks.
         self._job_show_all: dict[str, bool] = {}
+        # Preserve which expansions are open across refreshes.
+        self._job_expanded: dict[str, bool] = {}
 
-        # Reference to the actual download queue (set during download)
-        self._download_queue: DownloadQueue | None = None
+    # ------------------------------------------------------------------
+    # Rendering
+    # ------------------------------------------------------------------
 
     def render(self) -> None:
-        """Renders the download page."""
+        """Render the download page and subscribe to the service."""
+        self._client = ui.context.client
+
         with ui.column().classes("w-full max-w-4xl mx-auto p-4 gap-4"):
             ui.label(_("Music Download")).classes("text-2xl font-bold")
             self._render_url_input()
@@ -60,18 +66,15 @@ class DownloadPage:
             self._render_queue_card()
             self._render_log_card()
 
-        self._check_url_parameter()
+        # Initial paint from current snapshot.
+        self._rerender(download_service.get_snapshot())
 
-    def _check_url_parameter(self) -> None:
-        """Check for URL query parameter and fill input if present."""
-        url_param = app.storage.browser.get("url_param")
-        if url_param and self.url_input:
-            self.url_input.value = url_param
-            app.storage.browser["url_param"] = None
-            ui.notify(_("Download link added, click to start download"), type="info")
+        # Subscribe for future pushes.
+        self._sub_id = download_service.subscribe(self._on_snapshot)
+        self._client.on_disconnect(self._teardown)
 
     def _render_url_input(self) -> None:
-        """Render URL input section."""
+        """Render the URL input section."""
         with ui.card().classes("w-full"):
             ui.label(_("Enter Download URL")).classes("text-lg font-semibold mb-2")
             with ui.row().classes("w-full gap-2 items-end"):
@@ -82,22 +85,30 @@ class DownloadPage:
                     .classes("flex-grow")
                     .props("rows=3")
                 )
-                ui.button(
-                    _("Start Download"), icon="download", on_click=self._start_download
+                self.start_button = ui.button(
+                    _("Start Download"),
+                    icon="download",
+                    on_click=self._start_download,
                 ).props("color=primary")
 
     def _render_quick_options(self) -> None:
-        """Render quick options section."""
+        """Render quick option toggles."""
         with ui.card().classes("w-full"):
             ui.label(_("Quick Options")).classes("text-lg font-semibold mb-2")
-            with ui.row().classes("gap-4 flex-wrap"):
+            with ui.row().classes("gap-4 flex-wrap items-center"):
+                ui.select(
+                    label=_("Download Quality"),
+                    options=["minimum", "low", "medium", "high", "lossless", "hifi"],
+                    value=settings.global_settings.quality.tier,
+                    on_change=self._on_download_quality_change,
+                ).classes("w-40")
+
                 ui.checkbox(
                     _("Dry Run (Collect info only, no download)"),
-                    value=settings.global_settings.advanced.dry_run,
+                    value=settings.global_settings.download_behavior.dry_run,
                     on_change=self._on_dry_run_change,
                 )
 
-                # Archiver extension toggle (if installed)
                 archiver_settings = settings.extensions.get("post_download", {}).get(
                     "archiver"
                 )
@@ -108,7 +119,6 @@ class DownloadPage:
                         on_change=self._on_archiver_change,
                     )
 
-                # Gofile Uploader extension toggle (if installed)
                 gofile_settings = settings.extensions.get("post_download", {}).get(
                     "gofile_uploader"
                 )
@@ -119,130 +129,210 @@ class DownloadPage:
                         on_change=self._on_gofile_change,
                     )
 
-    def _on_dry_run_change(self, e: Any) -> None:
-        """Handles dry run checkbox change and saves settings.
-
-        Args:
-            e: The change event containing the new value.
-        """
-        settings.global_settings.advanced.dry_run = e.value
-        save_settings(_settings_path, settings.current)
-        ui.notify(
-            f"{_('Dry Run')} {_('enabled') if e.value else _('disabled')}", type="info"
-        )
-
-    def _on_extension_toggle(self, key: str, label: str, e: Any) -> None:
-        """Handles extension toggle checkbox change and saves settings.
-
-        Args:
-            key: Extension key in the post_download settings.
-            label: Display label for the notification.
-            e: The change event containing the new value.
-        """
-        ext_settings = settings.extensions.get("post_download", {}).get(key)
-        if ext_settings is not None:
-            ext_settings["enabled"] = e.value
-            save_settings(_settings_path, settings.current)
-            ui.notify(
-                f"{_(label)} {_('enabled') if e.value else _('disabled')}",
-                type="info",
-            )
-
-    def _on_archiver_change(self, e: Any) -> None:
-        """Handles archiver checkbox change and saves settings.
-
-        Args:
-            e: The change event containing the new value.
-        """
-        self._on_extension_toggle("archiver", "Archiver", e)
-
-    def _on_gofile_change(self, e: Any) -> None:
-        """Handles gofile uploader checkbox change and saves settings.
-
-        Args:
-            e: The change event containing the new value.
-        """
-        self._on_extension_toggle("gofile_uploader", "Gofile Uploader", e)
-
     def _render_queue_card(self) -> None:
-        """Render download queue card."""
+        """Render the download queue container."""
         with ui.card().classes("w-full"):
             with ui.row().classes("w-full justify-between items-center mb-2"):
                 ui.label(_("Download Queue")).classes("text-lg font-semibold")
                 ui.button(
                     _("Clear"), icon="delete_sweep", on_click=self._clear_queue
                 ).props("flat dense")
-            self._render_queue()
+            self._render_queue(download_service.get_snapshot())
 
     def _render_log_card(self) -> None:
-        """Render log card."""
+        """Render the log card and prime it from the current snapshot."""
         with ui.card().classes("w-full"):
             ui.label(_("Download Log")).classes("text-lg font-semibold mb-2")
             self.download_log = ui.log(max_lines=100).classes("w-full h-64")
-            storage = get_app_storage()
-            for log_msg in storage.get("logs", [])[-50:]:
-                self.download_log.push(log_msg)
+            snapshot = download_service.get_snapshot()
+            for line in snapshot.logs_tail:
+                self.download_log.push(line)
+            self._log_cursor = len(snapshot.logs_tail)
+
+    # ------------------------------------------------------------------
+    # Settings callbacks (unchanged semantics)
+    # ------------------------------------------------------------------
+
+    def _on_dry_run_change(self, e: Any) -> None:
+        """Handle the dry-run checkbox change and persist settings.
+
+        Args:
+            e: The change event carrying the new value.
+        """
+        settings.global_settings.download_behavior.dry_run = e.value
+        save_settings(SETTINGS_PATH, settings.current)
+        ui.notify(
+            f"{_('Dry Run')} {_('enabled') if e.value else _('disabled')}", type="info"
+        )
+
+    def _on_download_quality_change(self, e: Any) -> None:
+        """Handle the download-quality select change and persist settings.
+
+        Args:
+            e: The change event carrying the new value.
+        """
+        settings.global_settings.quality.tier = e.value
+        save_settings(SETTINGS_PATH, settings.current)
+        ui.notify(
+            f"{_('Download Quality')}: {e.value}",
+            type="info",
+        )
+
+    def _on_extension_toggle(self, key: str, label: str, e: Any) -> None:
+        """Handle an extension toggle and persist settings.
+
+        Args:
+            key: Extension key under ``extensions.post_download``.
+            label: Display label for the notification.
+            e: The change event carrying the new value.
+        """
+        ext_settings = settings.extensions.get("post_download", {}).get(key)
+        if ext_settings is not None:
+            ext_settings["enabled"] = e.value
+            save_settings(SETTINGS_PATH, settings.current)
+            ui.notify(
+                f"{_(label)} {_('enabled') if e.value else _('disabled')}",
+                type="info",
+            )
+
+    def _on_archiver_change(self, e: Any) -> None:
+        """Handle archiver checkbox change."""
+        self._on_extension_toggle("archiver", "Archiver", e)
+
+    def _on_gofile_change(self, e: Any) -> None:
+        """Handle gofile uploader checkbox change."""
+        self._on_extension_toggle("gofile_uploader", "Gofile Uploader", e)
+
+    # ------------------------------------------------------------------
+    # Snapshot subscription
+    # ------------------------------------------------------------------
+
+    def _on_snapshot(self, snapshot: ServiceSnapshot) -> None:
+        """Receive a snapshot from the service and schedule a rerender.
+
+        Called from the service/worker coroutine context — not this client's
+        UI context. Coalesces rapid updates so only the latest snapshot is
+        painted when the timer fires.
+
+        Args:
+            snapshot: The latest service snapshot.
+        """
+        if self._client is None:
+            return
+        self._latest = snapshot
+        if self._scheduled:
+            return
+        self._scheduled = True
+        client = self._client
+        with client:
+            background_tasks.create(
+                self._rerender_latest(), name="haberlea-download-rerender"
+            )
+
+    async def _rerender_latest(self) -> None:
+        """Drain the latest snapshot and rerender."""
+        try:
+            snapshot = self._latest
+            self._latest = None
+            if snapshot is None:
+                return
+            self._rerender(snapshot)
+        finally:
+            self._scheduled = False
+            # If a newer snapshot arrived while rendering, process it.
+            if self._latest is not None:
+                self._on_snapshot(self._latest)
+
+    def _rerender(self, snapshot: ServiceSnapshot) -> None:
+        """Apply a snapshot to the UI widgets.
+
+        Args:
+            snapshot: The snapshot to render.
+        """
+        with contextlib.suppress(RuntimeError):
+            if self.start_button is not None:
+                if snapshot.is_downloading:
+                    self.start_button.props("color=grey")
+                    self.start_button.set_text(_("Downloading..."))
+                else:
+                    self.start_button.props("color=primary")
+                    self.start_button.set_text(_("Start Download"))
+
+            # Append new log lines.
+            if self.download_log is not None and len(snapshot.logs_tail) > 0:
+                # If the tail got truncated below the cursor (shouldn't happen
+                # in practice but be safe), reset the cursor.
+                if self._log_cursor > len(snapshot.logs_tail):
+                    self._log_cursor = 0
+                for line in snapshot.logs_tail[self._log_cursor :]:
+                    self.download_log.push(line)
+                self._log_cursor = len(snapshot.logs_tail)
+
+            self._render_queue.refresh(snapshot)
+
+    # ------------------------------------------------------------------
+    # Queue rendering (driven from snapshot)
+    # ------------------------------------------------------------------
 
     @ui.refreshable_method
-    def _render_queue(self) -> None:
-        """Renders the job-based download queue display."""
-        # Save expansion states before refresh
-        saved_states: dict[str, bool] = {}
-        for job_id, expansion in self._job_expansions.items():
-            with contextlib.suppress(RuntimeError):
-                saved_states[job_id] = expansion.value
+    def _render_queue(self, snapshot: ServiceSnapshot) -> None:
+        """Render the queue cards from a snapshot.
 
-        # Clear UI element references (will be recreated)
-        self._job_cards.clear()
-        self._job_progress_bars.clear()
-        self._job_status_labels.clear()
-        self._job_expansions.clear()
-        self._track_rows.clear()
-        self._track_progress_bars.clear()
-
-        if not self._jobs:
+        Args:
+            snapshot: The snapshot to render.
+        """
+        if not snapshot.jobs and not snapshot.pending_batches:
             ui.label(_("Queue is empty")).classes("text-gray-500 py-4")
             return
 
         # Summary stats
-        total_jobs = len(self._jobs)
-        total_tracks = sum(j.get("total_tracks", 0) for j in self._jobs.values())
-        completed_tracks = sum(j.get("completed", 0) for j in self._jobs.values())
-        failed_tracks = sum(j.get("failed", 0) for j in self._jobs.values())
+        total_jobs = len(snapshot.jobs)
+        total_tracks = sum(j.total_tracks for j in snapshot.jobs)
+        completed_tracks = sum(j.completed for j in snapshot.jobs)
+        failed_tracks = sum(j.failed for j in snapshot.jobs)
 
         ui.label(
-            f"共 {total_jobs} 个任务 | {total_tracks} 首曲目 | "
-            f"完成: {completed_tracks} | 失败: {failed_tracks}"
+            f"{_('Total')}: {total_jobs} {ngettext('job', 'jobs', total_jobs)} | "
+            f"{total_tracks} {ngettext('track', 'tracks', total_tracks)} | "
+            f"{_('Completed')}: {completed_tracks} | {_('Failed')}: {failed_tracks}"
         ).classes("text-sm text-gray-600 mb-2")
 
-        # Render each job with saved expansion state
-        for job_id, job_data in self._jobs.items():
-            expanded = saved_states.get(job_id, True)
-            self._render_job_card(job_id, job_data, expanded)
+        # Pending batches (queued, not yet started)
+        if snapshot.pending_batches:
+            with ui.card().classes("w-full bg-gray-50 mb-2"):
+                ui.label(
+                    f"{_('Queued')}: {len(snapshot.pending_batches)} "
+                    f"{ngettext('batch', 'batches', len(snapshot.pending_batches))}"
+                ).classes("text-sm font-medium")
+                for i, batch in enumerate(snapshot.pending_batches, start=1):
+                    preview = ", ".join(batch[:3])
+                    if len(batch) > 3:
+                        preview += f" (+{len(batch) - 3})"
+                    ui.label(f"  {i}. {preview}").classes(
+                        "text-xs text-gray-600 truncate"
+                    )
+
+        # Render each job.
+        for job in snapshot.jobs:
+            expanded = self._job_expanded.get(job.job_id, True)
+            self._render_job_card(job, snapshot, expanded)
 
     def _render_job_card(
-        self, job_id: str, job_data: dict[str, Any], expanded: bool = True
+        self, job: JobSnapshot, snapshot: ServiceSnapshot, expanded: bool
     ) -> None:
-        """Renders a single job card with its tracks.
+        """Render a single job card with its tracks.
 
         Args:
-            job_id: The job identifier.
-            job_data: Job data dictionary.
+            job: The job snapshot.
+            snapshot: The full service snapshot (for track lookups).
             expanded: Whether the track list should be expanded.
         """
-        status = job_data.get("status", "pending")
-        media_type = job_data.get("media_type", "unknown")
-        name = job_data.get("name", job_data.get("original_url", job_id)[:50])
-        artist = job_data.get("artist", "")
-
-        # Media type icons
         type_icons = {
             "track": "music_note",
             "album": "album",
             "playlist": "queue_music",
             "artist": "person",
         }
-        # Status colors
         status_colors = {
             "pending": "bg-gray-100",
             "downloading": "bg-blue-50",
@@ -251,71 +341,66 @@ class DownloadPage:
             "failed": "bg-red-50",
         }
 
-        card_class = status_colors.get(status, "bg-gray-100")
-        with ui.card().classes(f"w-full {card_class} mb-2") as card:
-            self._job_cards[job_id] = card
-
-            # Job header
+        card_class = status_colors.get(job.status, "bg-gray-100")
+        with ui.card().classes(f"w-full {card_class} mb-2"):
             with ui.row().classes("w-full items-center gap-2"):
-                ui.icon(type_icons.get(media_type, "help")).classes("text-gray-600")
+                ui.icon(type_icons.get(job.media_type, "help")).classes("text-gray-600")
                 with ui.column().classes("flex-grow min-w-0"):
-                    display_name = f"{artist} - {name}" if artist else name
+                    display_name = (
+                        f"{job.artist} - {job.name}" if job.artist else job.name
+                    )
+                    if not display_name:
+                        display_name = job.original_url[:50]
                     ui.label(display_name).classes("font-medium truncate")
 
-                    # Progress info
-                    total = job_data.get("total_tracks", 0)
-                    completed = job_data.get("completed", 0)
-                    failed = job_data.get("failed", 0)
-                    skipped = job_data.get("skipped", 0)
-                    finished = completed + failed + skipped
-
-                    status_text = f"{finished}/{total} 曲目"
-                    if failed > 0:
-                        status_text += f" ({failed} 失败)"
-                    status_label = ui.label(status_text).classes(
-                        "text-xs text-gray-500"
+                    finished = job.completed + job.failed + job.skipped
+                    status_text = (
+                        f"{finished}/{job.total_tracks} "
+                        f"{ngettext('track', 'tracks', job.total_tracks)}"
                     )
-                    self._job_status_labels[job_id] = status_label
+                    if job.failed > 0:
+                        status_text += f" ({job.failed} {_('failed')})"
+                    ui.label(status_text).classes("text-xs text-gray-500")
 
-                # Job progress bar
-                progress = job_data.get("progress", 0.0)
-                progress_bar = ui.linear_progress(value=progress, show_value=True)
-                progress_bar.classes("w-32")
-                self._job_progress_bars[job_id] = progress_bar
+                ui.linear_progress(
+                    value=round(job.progress, 2), show_value=True
+                ).classes("w-32")
 
-            # Expandable track list with preserved state
-            track_ids = job_data.get("track_ids", [])
-            if track_ids:
+            if job.track_ids:
                 expansion = ui.expansion(
-                    f"{_('Track list')} ({len(track_ids)})", value=expanded
+                    f"{_('Track list')} ({len(job.track_ids)})", value=expanded
                 ).classes("w-full")
-                self._job_expansions[job_id] = expansion
+                expansion.on_value_change(
+                    lambda e, jid=job.job_id: self._on_expansion_change(jid, e.value)
+                )
                 with expansion:
-                    show_all = self._job_show_all.get(job_id, False)
+                    show_all = self._job_show_all.get(job.job_id, False)
                     visible_ids = (
-                        track_ids if show_all else track_ids[:MAX_VISIBLE_TRACKS]
+                        job.track_ids
+                        if show_all
+                        else job.track_ids[:MAX_VISIBLE_TRACKS]
                     )
                     for track_id in visible_ids:
-                        track_data = self._track_progress.get(track_id, {})
-                        self._render_track_row(track_id, track_data)
+                        track = snapshot.tracks.get(track_id)
+                        if track is not None:
+                            self._render_track_row(track)
 
-                    # Show "Show all" button if there are more tracks
-                    remaining = len(track_ids) - MAX_VISIBLE_TRACKS
+                    remaining = len(job.track_ids) - MAX_VISIBLE_TRACKS
                     if remaining > 0 and not show_all:
                         ui.button(
                             f"{_('Show all')} ({remaining} {_('more')})",
                             icon="expand_more",
-                            on_click=lambda _, jid=job_id: self._show_all_tracks(jid),
+                            on_click=lambda _e, jid=job.job_id: self._show_all_tracks(
+                                jid
+                            ),
                         ).props("flat dense").classes("w-full mt-1")
 
-    def _render_track_row(self, track_id: str, track_data: dict[str, Any]) -> None:
-        """Renders a single track row within a job.
+    def _render_track_row(self, track: Any) -> None:
+        """Render a single track row.
 
         Args:
-            track_id: The track identifier.
-            track_data: Track progress data.
+            track: The ``TrackSnapshot`` to render.
         """
-        status = track_data.get("status", "pending")
         status_icons = {
             "pending": "schedule",
             "downloading": "downloading",
@@ -330,288 +415,93 @@ class DownloadPage:
             "failed": "text-red-500",
             "skipped": "text-orange-500",
         }
+        quality_badges = {
+            "hires": ("Hi-Res", "bg-green-500 text-white"),
+            "lossless": ("Lossless", "bg-sky-600 text-white"),
+            "lossy": ("Lossy", "bg-orange-500 text-white"),
+        }
 
         with ui.row().classes(
             "w-full items-center gap-2 py-1 border-b border-gray-100"
-        ) as row:
-            self._track_rows[track_id] = row
-
-            ui.icon(status_icons.get(status, "help")).classes(
-                f"text-sm {status_colors.get(status, 'text-gray-400')}"
+        ):
+            ui.icon(status_icons.get(track.status, "help")).classes(
+                f"text-sm {status_colors.get(track.status, 'text-gray-400')}"
             )
 
-            name = track_data.get("name", track_id[:20])
-            artist = track_data.get("artist", "")
-            display = f"{artist} - {name}" if artist else name
+            badge = quality_badges.get(track.quality)
+            if badge is not None:
+                label, badge_class = badge
+                ui.label(label).classes(f"text-xs px-1.5 py-0.5 rounded {badge_class}")
+
+            display = f"{track.artist} - {track.name}" if track.artist else track.name
+            if not display:
+                display = track.task_id[:20]
             ui.label(display).classes("text-sm flex-grow truncate")
 
-            message = track_data.get("message", "")
-            if message:
-                ui.label(message).classes("text-xs text-gray-500")
+            if track.message:
+                ui.label(track.message).classes("text-xs text-gray-500")
 
-            if status == "downloading":
-                progress = track_data.get("progress", 0.0)
-                progress_bar = ui.linear_progress(value=progress).classes("w-20")
-                self._track_progress_bars[track_id] = progress_bar
+            if track.status == "downloading":
+                ui.linear_progress(value=round(track.progress, 2)).classes("w-20")
+
+    def _on_expansion_change(self, job_id: str, value: bool) -> None:
+        """Record expansion state so refreshes preserve it.
+
+        Args:
+            job_id: Job identifier.
+            value: New expansion state.
+        """
+        self._job_expanded[job_id] = value
 
     def _show_all_tracks(self, job_id: str) -> None:
-        """Toggles the show all state for a job's track list.
+        """Flip the show-all flag for a job and rerender.
 
         Args:
-            job_id: The job identifier.
+            job_id: Job identifier.
         """
         self._job_show_all[job_id] = True
-        self._render_queue.refresh()
+        self._render_queue.refresh(download_service.get_snapshot())
 
-    def _clear_queue(self) -> None:
-        """Clears the job queue."""
-        self._jobs.clear()
-        self._track_progress.clear()
-        self._job_cards.clear()
-        self._job_progress_bars.clear()
-        self._job_status_labels.clear()
-        self._job_expansions.clear()
-        self._job_show_all.clear()
-        self._track_rows.clear()
-        self._track_progress_bars.clear()
-        self._render_queue.refresh()
-        ui.notify(_("Queue cleared"), type="info")
-
-    def _on_progress(self, event: ProgressEvent) -> None:
-        """Callback for track progress updates.
-
-        Args:
-            event: Progress event from the unified progress system.
-        """
-        task_id = event.task_id
-        old_status = self._track_progress.get(task_id, {}).get("status")
-        new_status = event.status.value
-
-        self._track_progress[task_id] = {
-            "task_id": task_id,
-            "name": event.name,
-            "artist": event.artist,
-            "album": event.album,
-            "service": event.service,
-            "status": new_status,
-            "progress": event.progress,
-            "message": event.message,
-        }
-
-        # Update job progress from the actual queue
-        self._sync_job_progress()
-
-        with contextlib.suppress(RuntimeError):
-            # If status changed, refresh the whole queue display
-            if old_status != new_status:
-                self._render_queue.refresh()
-                return
-
-            # Otherwise just update the progress bar
-            if task_id in self._track_progress_bars:
-                self._track_progress_bars[task_id].set_value(round(event.progress, 2))
-
-    def _sync_job_progress(self) -> None:
-        """Syncs job progress from the actual download queue."""
-        if not self._download_queue:
-            return
-
-        for job in self._download_queue.get_all_jobs():
-            job_id = job.job_id
-            progress = self._download_queue.get_job_progress(job_id)
-
-            if job_id in self._jobs:
-                self._jobs[job_id].update(
-                    {
-                        "status": job.status.value,
-                        "completed": progress.completed,
-                        "failed": progress.failed,
-                        "skipped": progress.skipped,
-                        "progress": progress.progress,
-                    }
-                )
-
-            with contextlib.suppress(RuntimeError):
-                if job_id in self._job_progress_bars:
-                    # Use 1.0 if job is finished to ensure final state is correct
-                    if progress.is_finished:
-                        display_progress = 1.0
-                    else:
-                        display_progress = progress.progress
-                    self._job_progress_bars[job_id].set_value(
-                        round(display_progress, 2)
-                    )
-                if job_id in self._job_status_labels:
-                    finished = progress.finished
-                    status_text = f"{finished}/{progress.total} 曲目"
-                    if progress.failed > 0:
-                        status_text += f" ({progress.failed} 失败)"
-                    self._job_status_labels[job_id].set_text(status_text)
-
-    def _register_jobs_from_queue(self, queue: DownloadQueue) -> None:
-        """Registers jobs from the download queue for UI display.
-
-        Args:
-            queue: The download queue instance.
-        """
-        self._download_queue = queue
-
-        for job in queue.get_all_jobs():
-            self._jobs[job.job_id] = {
-                "job_id": job.job_id,
-                "original_url": job.original_url,
-                "media_type": job.media_type.value,
-                "name": job.name,
-                "artist": job.artist,
-                "status": job.status.value,
-                "total_tracks": job.total_tracks,
-                "completed": len(job.completed_tracks),
-                "failed": len(job.failed_tracks),
-                "skipped": len(job.skipped_tracks),
-                "progress": job.progress,
-                "track_ids": list(job.track_ids),
-            }
-
-        self._render_queue.refresh()
+    # ------------------------------------------------------------------
+    # Commands
+    # ------------------------------------------------------------------
 
     async def _start_download(self) -> None:
-        """Starts downloading URLs from input."""
-        if self._is_downloading:
-            ui.notify(_("Download in progress"), type="warning")
-            return
-
+        """Submit the URLs currently in the input to the service."""
         if not self.url_input or not self.url_input.value:
             ui.notify(_("Please enter download URL"), type="warning")
             return
 
-        urls = [url for url in self.url_input.value.split() if url.startswith("http")]
-
+        urls = tuple(
+            url for url in self.url_input.value.split() if url.startswith("http")
+        )
         if not urls:
             ui.notify(_("Please enter valid download URL"), type="warning")
             return
 
         self.url_input.value = ""
-        self._is_downloading = True
-        self._jobs.clear()
-        self._track_progress.clear()
-        self._render_queue.refresh()
+        add_log(f"{_('Submitted')} {len(urls)} {_('links')}")
+        await download_service.submit_urls(urls)
 
-        try:
-            await self.download_urls(urls)
-        finally:
-            self._is_downloading = False
-            self._download_queue = None
-            self._render_queue.refresh()
+    async def _clear_queue(self) -> None:
+        """Clear completed jobs from the service."""
+        await download_service.clear_completed()
+        ui.notify(_("Queue cleared"), type="info")
 
     async def download_urls(self, urls: list[str]) -> None:
-        """Downloads multiple URLs using the job-based queue.
-
-        This method can be called from other pages to trigger downloads.
+        """Public entry point used by other pages/extensions.
 
         Args:
-            urls: List of URLs to download.
+            urls: URLs to download.
         """
-        self._log(f"{_('Starting download')} {len(urls)} {_('links')}")
-        set_callback(self._on_progress)
+        await download_service.submit_urls(tuple(urls))
 
-        try:
-            haberlea = Haberlea()
-            media_to_download = await resolve_urls_to_media(haberlea, tuple(urls))
+    # ------------------------------------------------------------------
+    # Teardown
+    # ------------------------------------------------------------------
 
-            for service, media_list in media_to_download.items():
-                self._log(f"{_('Service')} {service}: {len(media_list)} {_('items')}")
-
-            output_path = settings.global_settings.general.download_path
-
-            tpm: dict[ModuleModes, str] = {}
-            for mode_name in ["covers", "lyrics", "credits"]:
-                mode_value: str | None = getattr(
-                    settings.global_settings.module_defaults, mode_name, "default"
-                )
-                if mode_value and mode_value != "default":
-                    tpm[ModuleModes[mode_name]] = mode_value
-
-            # Use custom download function that exposes the queue
-            completed, failed = await self._run_download_with_queue(
-                haberlea,
-                media_to_download,
-                tpm,
-                "default",
-                output_path,
-            )
-
-            self._log(
-                f"{_('Done')}: {len(completed)} {_('success')}, "
-                f"{len(failed)} {_('failed')}"
-            )
-
-        except (ValueError, OSError) as e:
-            # Handle common errors from URL parsing and file operations
-            self._log(f"{_('Download error')}: {e}")
-            self._log(f"{_('Details')}: {traceback.format_exc()}")
-        except Exception as e:
-            # Catch any unexpected errors and log them
-            self._log(f"{_('Unexpected error')}: {e}")
-            self._log(f"{_('Details')}: {traceback.format_exc()}")
-        finally:
-            set_callback(None)
-            clear_all()
-
-    async def _run_download_with_queue(
-        self,
-        haberlea_session: Haberlea,
-        media_to_download: dict[str, list[MediaIdentification]],
-        third_party_modules: dict[ModuleModes, str],
-        separate_download_module: str,
-        output_path: str,
-    ) -> tuple[list[str], list[tuple[str, str]]]:
-        """Runs download using core function with UI progress tracking.
-
-        Args:
-            haberlea_session: The Haberlea session.
-            media_to_download: Media items to download by module.
-            third_party_modules: Third-party module mappings.
-            separate_download_module: Module for separate downloading.
-            output_path: Output directory path.
-
-        Returns:
-            Tuple of (completed track IDs, failed track IDs with errors).
-        """
-        # Set extension log callback to route output to WebUI
-        ExtensionBase.set_log_callback(self._log)
-
-        def on_queue_ready(queue: DownloadQueue) -> None:
-            """Registers queue for UI display when ready."""
-            self._register_jobs_from_queue(queue)
-            self._log(
-                f"{_('Added')} {queue.job_count} {_('jobs')}, "
-                f"{queue.track_count} {_('tracks')}"
-            )
-
-        try:
-            completed, failed = await haberlea_core_download(
-                haberlea_session,
-                media_to_download,
-                third_party_modules,
-                separate_download_module,
-                output_path,
-                on_queue_ready=on_queue_ready,
-            )
-
-            # Final sync to ensure UI shows 100% completion
-            self._sync_job_progress()
-
-            return completed, failed
-        finally:
-            ExtensionBase.set_log_callback(None)
-
-    def _log(self, message: str) -> None:
-        """Logs a message.
-
-        Args:
-            message: Message to log.
-        """
-        add_log(message)
-        if self.download_log:
-            with contextlib.suppress(RuntimeError):
-                self.download_log.push(message)
+    def _teardown(self) -> None:
+        """Unsubscribe when the client disconnects."""
+        if self._sub_id is not None:
+            download_service.unsubscribe(self._sub_id)
+            self._sub_id = None

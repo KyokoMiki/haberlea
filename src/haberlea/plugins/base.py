@@ -4,8 +4,12 @@ This module defines the abstract base classes that all modules and extensions
 must implement to be compatible with the Haberlea plugin system.
 """
 
+import logging
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+import msgspec
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -27,6 +31,14 @@ if TYPE_CHECKING:
         TrackDownloadInfo,
         TrackInfo,
     )
+
+
+class TrackCompleteEvent(msgspec.Struct, frozen=True):
+    """Track completion event data — replaces 3-arg on_track_complete."""
+
+    job: Any  # DownloadJob — avoid circular import
+    track_id: str
+    track_info: Any  # TrackInfo
 
 
 class WebUIPageBase(ABC):
@@ -110,7 +122,7 @@ class ModuleBase(ABC):
     @abstractmethod
     async def get_track_download(
         self,
-        target_path: str,
+        target_path: Path,
         url: str = "",
         data: "dict | None" = None,
     ) -> "TrackDownloadInfo":
@@ -271,7 +283,7 @@ class ExtensionBase(ABC):
         cls._log_callback = callback
 
     def log(self, message: str) -> None:
-        """Logs a message using the configured callback or print.
+        """Logs a message using the configured callback or logger.
 
         Args:
             message: Message to log.
@@ -279,7 +291,7 @@ class ExtensionBase(ABC):
         if ExtensionBase._log_callback:
             ExtensionBase._log_callback(message)
         else:
-            print(message)
+            logging.getLogger(__name__).info("%s", message)
 
     @abstractmethod
     async def on_job_complete(self, job: "DownloadJob") -> None:
@@ -290,18 +302,11 @@ class ExtensionBase(ABC):
         """
         ...
 
-    async def on_track_complete(
-        self,
-        job: "DownloadJob",
-        track_id: str,
-        track_info: "TrackInfo",
-    ) -> None:
+    async def on_track_complete(self, event: "TrackCompleteEvent") -> None:
         """Called when a single track download completes.
 
         Args:
-            job: The download job this track belongs to.
-            track_id: The track identifier.
-            track_info: Track metadata with quality information.
+            event: TrackCompleteEvent with job, track_id, and track_info.
         """
         return None
 

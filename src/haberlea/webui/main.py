@@ -6,17 +6,21 @@ import sys
 from typing import Any
 
 from nicegui import app, ui
+from rich.logging import RichHandler
 
+from haberlea.core import cleanup_modules
+from haberlea.core.bootstrap import bootstrap, persist_and_check, reconcile
+from haberlea.core.haberlea import Haberlea
 from haberlea.i18n import _, set_language
-from haberlea.plugins.loader import discover_extensions
-from haberlea.utils.settings import settings
+from haberlea.utils.settings import NICEGUI_STORAGE_DIR, SETTINGS_PATH, settings
 
 from .auth import AuthMiddleware, create_login_page
+from .download_service import init_download_service
 from .pages.download import DownloadPage
 from .pages.logs import LogsPage
 from .pages.search import SearchPage
 from .pages.settings import SettingsPage
-from .state import get_user_storage, register_page
+from .state import get_haberlea, get_user_preferences, init_haberlea, register_page
 
 logger = logging.getLogger(__name__)
 
@@ -25,35 +29,41 @@ def install_event_loop() -> None:
     """Installs the appropriate event loop for the current platform."""
     if sys.platform == "win32":
         try:
-            import winloop  # type: ignore[import-not-found] # noqa: PLC0415
+            import winloop  # type: ignore[import-not-found]  # noqa: PLC0415
 
             winloop.install()
         except ImportError:
             logger.info("winloop not available, using default asyncio event loop")
     else:
         try:
-            import uvloop  # type: ignore[import-not-found] # noqa: PLC0415
+            import uvloop  # type: ignore[import-not-found]  # noqa: PLC0415
 
             uvloop.install()
         except ImportError:
             logger.info("uvloop not available, using default asyncio event loop")
 
 
-def _discover_extension_webui_pages() -> dict[str, type]:
-    """Discover WebUI pages from installed extensions.
+def configure_logging() -> None:
+    """Configures logging based on debug mode setting."""
+    level = (
+        logging.DEBUG if settings.global_settings.runtime.debug_mode else logging.INFO
+    )
+    logging.basicConfig(
+        level=level,
+        format="%(message)s",
+        datefmt="[%X]",
+        handlers=[RichHandler(rich_tracebacks=True, show_path=False)],
+    )
+
+
+def _get_extension_webui_pages() -> dict[str, type]:
+    """Gets WebUI pages from the initialized extension manager.
 
     Returns:
         Dictionary mapping extension names to their WebUI page classes.
     """
-    pages: dict[str, type] = {}
-    extensions = discover_extensions()
-
-    for ext_name, ext_info in extensions.items():
-        if ext_info.webui_page is not None:
-            pages[ext_name] = ext_info.webui_page
-            logger.debug(f"Discovered WebUI page from extension: {ext_name}")
-
-    return pages
+    haberlea = get_haberlea()
+    return haberlea.extension_manager.get_webui_pages()
 
 
 # Cache for extension page instances
@@ -71,8 +81,8 @@ def index_page() -> None:
     set_language(user_language)
 
     # Apply dark mode from user preferences
-    prefs = get_user_storage()
-    if prefs.get("dark_mode", False):
+    prefs = get_user_preferences()
+    if prefs.dark_mode:
         ui.dark_mode().enable()
     else:
         ui.dark_mode().disable()
@@ -89,8 +99,8 @@ def index_page() -> None:
     register_page("settings", settings_page)
     register_page("logs", logs_page)
 
-    # Discover and create extension pages
-    extension_page_classes = _discover_extension_webui_pages()
+    # Create extension pages from initialized manager
+    extension_page_classes = _get_extension_webui_pages()
     for ext_name, page_class in extension_page_classes.items():
         page_instance = page_class()
         page_id = getattr(page_class, "page_id", ext_name)
@@ -161,39 +171,62 @@ def index_page() -> None:
 
 
 def main() -> None:
-    """Main entry point for the WebUI application."""
-    # Install uvloop/winloop before starting
+    """Main entry point for Haberlea WebUI.
+
+    Runs the three-phase initialization pipeline before starting NiceGUI:
+    1. bootstrap — discover modules/extensions, load settings
+    2. reconcile — merge defaults, compute sessions
+    3. persist_and_check — write to disk, exit if new settings detected
+    """
     install_event_loop()
 
-    # Add authentication middleware
-    app.add_middleware(AuthMiddleware)
+    # Three-phase initialization
+    bootstrap_result = bootstrap()
+    configure_logging()
 
-    # Create login page
-    create_login_page()
+    reconcile_result = reconcile(bootstrap_result, settings.current)
+    has_new = persist_and_check(reconcile_result)
 
-    # Configure storage
-    app.storage.general["haberlea"] = app.storage.general.get(
-        "haberlea",
-        {
-            "download_queue": [],
-            "logs": [],
-            "is_downloading": False,
-        },
-    )
+    if has_new:
+        logger.warning(
+            "New settings detected, or the configuration has been reset. "
+            "Please update settings file: %s",
+            SETTINGS_PATH,
+        )
+        raise SystemExit(0)
 
-    storage_secret = os.getenv(
-        "HABERLEA_STORAGE_SECRET",
-        settings.global_settings.webui.storage_secret,
-    )
+    # Build and store global Haberlea singleton
+    haberlea = Haberlea.from_reconciled(bootstrap_result, reconcile_result)
+    init_haberlea(haberlea)
+    init_download_service(haberlea)
+
+    async def _shutdown() -> None:
+        await cleanup_modules(haberlea)
+
+    app.on_shutdown(_shutdown)
+
+    # Configure NiceGUI middleware and auth
+    if settings.global_settings.webui.auth_enabled:
+        app.add_middleware(AuthMiddleware)
+        create_login_page()
+
+    # Storage secret for NiceGUI
+    storage_secret = os.environ.get("NICEGUI_STORAGE_SECRET", "haberlea-webui-secret")
+
+    # Redirect NiceGUI's `.nicegui` storage directory to live under CONFIG_DIR
+    NICEGUI_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+    app.storage.path = NICEGUI_STORAGE_DIR
+
     ui.run(
-        title="Haberlea - 音乐下载器",
-        host=settings.global_settings.webui.host or None,
-        port=settings.global_settings.webui.port,
-        reload=False,
-        show=True,
+        title="Haberlea",
+        favicon="♪",
         storage_secret=storage_secret,
+        host=settings.global_settings.webui.host,
+        port=settings.global_settings.webui.port,
+        show=True,
+        reload=False,
     )
 
 
-if __name__ in {"__main__", "__mp_main__"}:
+if __name__ == "__main__":
     main()

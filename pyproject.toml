@@ -1,5 +1,5 @@
 [build-system]
-requires = ["uv_build"]
+requires = ["uv_build>=0.9.1,<0.12.0"]
 build-backend = "uv_build"
 
 [project]
@@ -8,12 +8,11 @@ version = "0.1.0"
 description = "A modular music downloader with support for multiple streaming services"
 requires-python = ">=3.11"
 dependencies = [
-    "aiofiles>=25.1.0",
-    "aiohttp>=3.13.2",
+    "aiohttp>=3.13.2 ; sys_platform == 'win32'",
+    "aiohttp[speedups]>=3.13.2 ; sys_platform != 'win32'",
     "anyio>=4.12.0",
     "asyncclick>=8.3.0.7",
     "asyncer>=0.0.12",
-    "av>=16.0.1",
     "babel>=2.17.0",
     "humanfriendly>=10.0",
     "msgspec[toml]>=0.20.0",
@@ -44,7 +43,7 @@ dev = ["ruff"]
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "UP", "B", "SIM", "I", "TC", "C90"]
+select = ["E", "F", "UP", "B", "SIM", "I", "TC", "C90", "PLC0415", "TID"]
 
 [tool.pyright]
 include = ["src"]

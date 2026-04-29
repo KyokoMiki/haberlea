@@ -241,9 +241,6 @@ msgstr "播放列表设置"
 msgid "Save M3U Playlist"
 msgstr "保存 M3U 播放列表"
 
-msgid "M3U Path Type"
-msgstr "M3U 路径类型"
-
 msgid "Extended M3U Format"
 msgstr "扩展 M3U 格式"
 
@@ -263,11 +260,8 @@ msgstr "Dry Run（仅收集信息，不下载）"
 msgid "Debug Mode"
 msgstr "调试模式"
 
-msgid "Ignore Existing Files"
-msgstr "忽略已存在文件"
-
-msgid "Disable Subscription Checks"
-msgstr "禁用订阅检查"
+msgid "Force Re-download Existing Files"
+msgstr "强制重新下载已存在文件"
 
 msgid "Abort Download When Single Failed"
 msgstr "单曲失败时中止下载"
@@ -528,11 +522,44 @@ msgstr "未预期的错误"
 msgid "Added"
 msgstr "已添加"
 
-msgid "jobs"
-msgstr "个任务"
+msgid "job"
+msgid_plural "jobs"
+msgstr[0] "个任务"
 
-msgid "tracks"
-msgstr "首曲目"
+msgid "Total"
+msgstr "共"
+
+msgid "Completed"
+msgstr "完成"
+
+msgid "Failed"
+msgstr "失败"
+
+# Downloader progress messages
+msgid "Fetching track info..."
+msgstr "获取曲目信息..."
+
+msgid "Downloading audio file"
+msgstr "下载音频文件"
+
+msgid "Downloading cover"
+msgstr "下载封面"
+
+msgid "Fetching lyrics"
+msgstr "获取歌词"
+
+msgid "Writing tags"
+msgstr "写入标签"
+
+msgid "Download completed"
+msgstr "下载完成"
+
+msgid "Skipped"
+msgstr "已跳过"
+
+msgid "track"
+msgid_plural "tracks"
+msgstr[0] "首曲目"
 
 msgid "Track list"
 msgstr "曲目列表"
@@ -600,5 +627,67 @@ msgstr "用户名或密码错误"
 msgid "Haberlea Login"
 msgstr "Haberlea 登录"
 
-msgid "accounts"
-msgstr "个账号"
+msgid "account"
+msgid_plural "accounts"
+msgstr[0] "个账号"
+
+msgid "batch"
+msgid_plural "batches"
+msgstr[0] "个批次"
+
+# Settings - Restructured (runtime/quality/etc)
+msgid "Runtime"
+msgstr "运行时"
+
+msgid "Runtime Options"
+msgstr "运行时选项"
+
+msgid "Quality"
+msgstr "质量"
+
+msgid "Quality Options"
+msgstr "质量选项"
+
+msgid "Playlist"
+msgstr "播放列表"
+
+msgid "Download Behavior"
+msgstr "下载行为"
+
+msgid "Output"
+msgstr "输出"
+
+msgid "Behavior"
+msgstr "行为"
+
+msgid "Compress Embedded Cover"
+msgstr "压缩嵌入封面"
+
+msgid "Compress External Covers"
+msgstr "压缩外部封面"
+
+# Module / account UI
+msgid "Display Name"
+msgstr "显示名称"
+
+msgid "Region Tag"
+msgstr "地区标签"
+
+msgid "Apply"
+msgstr "应用"
+
+msgid "Auto-fill from pasted text"
+msgstr "从粘贴文本自动填充"
+
+msgid "Auto-fill account from text"
+msgstr "从文本自动填充账号"
+
+msgid "Auto-filled: {fields}"
+msgstr "已自动填充: {fields}"
+
+msgid "No recognizable fields found"
+msgstr "未找到可识别的字段"
+
+# Download Page - extra
+msgid "Downloading..."
+msgstr "下载中..."

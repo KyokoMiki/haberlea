@@ -5,11 +5,9 @@ from typing import Any
 from nicegui import ui
 
 from haberlea.i18n import _
-
-from ...core import Haberlea
-from ...utils.models import DownloadTypeEnum, ModuleFlags
-from ...utils.settings import settings
-from ..state import add_download_task
+from haberlea.utils.models import DownloadTypeEnum, ModuleFlags
+from haberlea.utils.settings import settings
+from haberlea.webui.state import add_download_task, get_haberlea
 
 
 class SearchPage:
@@ -78,13 +76,16 @@ class SearchPage:
             List of service names.
         """
         try:
-            haberlea = Haberlea()
+            haberlea = get_haberlea()
             return [
                 m
-                for m in haberlea.module_list
+                for m in haberlea.module_registry.state.module_list
                 if (
-                    haberlea.module_settings[m].flags is None
-                    or not (haberlea.module_settings[m].flags & ModuleFlags.hidden)
+                    haberlea.module_registry.state.module_settings[m].flags is None
+                    or not (
+                        haberlea.module_registry.state.module_settings[m].flags
+                        & ModuleFlags.hidden
+                    )
                 )
             ]
         except Exception:
@@ -106,11 +107,11 @@ class SearchPage:
         ui.notify(f"{_('Searching')}: {query}", type="info")
 
         try:
-            haberlea = Haberlea()
+            haberlea = get_haberlea()
             module = await haberlea.load_module(self.selected_service)
 
             query_type = DownloadTypeEnum[self.selected_type]
-            limit = settings.global_settings.general.search_limit
+            limit = settings.global_settings.runtime.search_limit
 
             self.search_results = await module.search(query_type, query, limit=limit)
             self._render_results.refresh()

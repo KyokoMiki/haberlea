@@ -9,14 +9,14 @@ import hashlib
 import logging
 import math
 import operator
-import os
 import re
 import shutil
 import zipfile
 from collections.abc import Callable
 from functools import reduce
 from pathlib import Path
-from typing import Any
+from time import gmtime, strftime
+from typing import TYPE_CHECKING, Any
 
 import aiohttp
 import anyio
@@ -34,7 +34,26 @@ from tenacity import (
 from .exceptions import InvalidHashTypeError, TemporarySettingsError
 from .progress import ProgressMode, advance, get_current_task, reset, update
 
+if TYPE_CHECKING:
+    from haberlea.downloader.contexts import ArtworkSettings
+
 logger = logging.getLogger(__name__)
+
+
+class DownloadConfig(msgspec.Struct, frozen=True):
+    """Download behavior configuration.
+
+    Attributes:
+        headers: HTTP headers for the request.
+        task_id: Task ID for progress reporting.
+        chunk_processor: Optional callback to process each chunk before writing.
+        chunk_size: Size of chunks to download in bytes.
+    """
+
+    headers: dict[str, str] = msgspec.field(default_factory=dict)
+    task_id: str | None = None
+    chunk_processor: Callable[[bytes, int], bytes] | None = None
+    chunk_size: int = 1048576
 
 
 def hash_string(input_str: str, hash_type: str = "BLAKE2B") -> str:
@@ -110,7 +129,7 @@ def sanitise_name(name: str | None) -> str:
     )
 
 
-def fix_byte_limit(path: str, byte_limit: int = 250) -> str:
+def fix_byte_limit(path: Path, byte_limit: int = 250) -> Path:
     """Truncates a file path to fit within a byte limit.
 
     Args:
@@ -120,41 +139,47 @@ def fix_byte_limit(path: str, byte_limit: int = 250) -> str:
     Returns:
         The truncated file path.
     """
-    rel_path = os.path.abspath(path).replace("\\", "/")
-    directory, filename = os.path.split(rel_path)
+    resolved = path.resolve()
+    directory = resolved.parent
+    filename = resolved.name
     filename_bytes = filename.encode("utf-8")
     fixed_bytes = filename_bytes[:byte_limit]
     fixed_filename = fixed_bytes.decode("utf-8", "ignore")
-    return directory + "/" + fixed_filename
+    return directory / fixed_filename
 
 
-def _process_artwork(file_location: str, artwork_settings: dict[str, Any]) -> None:
+def _process_artwork(
+    file_location: Path,
+    artwork_settings: "ArtworkSettings",
+) -> None:
     """Process and resize artwork image.
 
     Args:
         file_location: Path to the image file.
         artwork_settings: Settings for resizing artwork.
     """
-    if not artwork_settings.get("should_resize", False):
+    if not artwork_settings.should_resize:
         return
 
-    new_resolution = artwork_settings.get("resolution", 1400)
-    new_format = artwork_settings.get("format", "jpeg")
+    new_resolution = artwork_settings.resolution
+    new_format = artwork_settings.format
     if new_format == "jpg":
         new_format = "jpeg"
 
-    new_compression = artwork_settings.get("compression", "low")
-    if new_compression == "low":
+    new_compression: int | None
+    if artwork_settings.compression == "low":
         new_compression = 90
-    elif new_compression == "high":
+    elif artwork_settings.compression == "high":
         new_compression = 70
+    else:
+        new_compression = 90
 
     if new_format == "png":
         new_compression = None
 
-    with Image.open(file_location) as im:
+    with Image.open(str(file_location)) as im:
         im = im.resize((new_resolution, new_resolution), Image.Resampling.BICUBIC)
-        im.save(file_location, new_format, quality=new_compression)
+        im.save(str(file_location), new_format, quality=new_compression)
 
 
 @retry(
@@ -166,53 +191,44 @@ def _process_artwork(file_location: str, artwork_settings: dict[str, Any]) -> No
 )
 async def _download_with_retry(
     url: str,
-    file_location: str,
-    headers: dict[str, str],
+    file_location: Path,
     session: aiohttp.ClientSession,
-    task_id: str | None,
-    chunk_processor: Callable[[bytes, int], bytes] | None = None,
-    chunk_size: int = 1048576,
+    config: DownloadConfig,
 ) -> None:
     """Download file with retry logic.
 
     Args:
         url: URL to download from.
         file_location: Local file path.
-        headers: HTTP headers.
         session: aiohttp session.
-        task_id: Task ID for progress reporting.
-        chunk_processor: Optional callback to process each chunk before writing.
-            Useful for streaming decryption during download.
-        chunk_size: Size of chunks to download. Defaults to 1 MiB.
+        config: Download configuration (headers, task_id, chunk_processor, chunk_size).
     """
     logger.debug("Starting download attempt for: %s", url)
-    async with session.get(url, headers=headers, ssl=False) as response:
+    async with session.get(url, headers=config.headers, ssl=False) as response:
         response.raise_for_status()
         total = response.content_length or 0
 
-        async with await anyio.open_file(file_location, "wb") as f:
+        async with await anyio.open_file(str(file_location), "wb") as f:
             chunk_index = 0
-            async for chunk in response.content.iter_chunked(chunk_size):
+            async for chunk in response.content.iter_chunked(config.chunk_size):
                 if chunk:
                     original_len = len(chunk)
-                    if chunk_processor:
+                    if config.chunk_processor:
                         # Run CPU-intensive decryption in thread pool
-                        chunk = await asyncify(chunk_processor)(chunk, chunk_index)
+                        chunk = await asyncify(config.chunk_processor)(
+                            chunk, chunk_index
+                        )
                     await f.write(chunk)
                     chunk_index += 1
-                    if task_id and total > 0:
-                        await advance(task_id, original_len, total)
+                    if config.task_id and total > 0:
+                        await advance(config.task_id, original_len, total)
 
 
 async def download_file(
     url: str,
-    file_location: str,
-    headers: dict[str, str] | None = None,
-    artwork_settings: dict[str, Any] | None = None,
+    file_location: Path,
+    config: DownloadConfig | None = None,
     session: aiohttp.ClientSession | None = None,
-    task_id: str | None = None,
-    chunk_processor: Callable[[bytes, int], bytes] | None = None,
-    chunk_size: int = 1048576,
 ) -> None:
     """Downloads a file asynchronously using aiohttp with automatic retry.
 
@@ -222,29 +238,22 @@ async def download_file(
     Args:
         url: The URL to download from.
         file_location: The local path to save the file.
-        headers: Optional HTTP headers for the request.
-        artwork_settings: Optional settings for resizing artwork.
+        config: Optional download configuration (headers, task_id, chunk_processor,
+            chunk_size). Defaults to DownloadConfig() with sensible defaults.
         session: Optional aiohttp session to reuse.
-        task_id: Optional task ID for progress reporting.
-        chunk_processor: Optional callback to process each chunk before writing.
-            Signature: (chunk: bytes, chunk_index: int) -> bytes.
-            Useful for streaming decryption during download.
-        chunk_size: Size of chunks to download in bytes. Defaults to 1 MiB.
-            Set to match decryption block size when using chunk_processor.
 
     Raises:
         KeyboardInterrupt: If the download is interrupted by the user.
         aiohttp.ClientError: If the download fails after all retries.
     """
-    if headers is None:
-        headers = {}
-    if os.path.isfile(file_location):
+    if config is None:
+        config = DownloadConfig()
+
+    if file_location.is_file():
         return
 
     # Ensure parent directory exists
-    parent_dir = os.path.dirname(file_location)
-    if parent_dir:
-        os.makedirs(parent_dir, exist_ok=True)
+    file_location.parent.mkdir(parents=True, exist_ok=True)
 
     close_session = False
     if session is None:
@@ -252,26 +261,23 @@ async def download_file(
         close_session = True
 
     # Get task ID from context or parameter
-    effective_task_id = task_id or get_current_task()
+    effective_task_id = config.task_id or get_current_task()
     if effective_task_id:
         reset(effective_task_id)
         await update(effective_task_id, mode=ProgressMode.BYTES)
 
-    try:
-        await _download_with_retry(
-            url,
-            file_location,
-            headers,
-            session,
-            effective_task_id,
-            chunk_processor,
-            chunk_size,
-        )
+    # Merge effective_task_id into config for _download_with_retry
+    effective_config = DownloadConfig(
+        headers=config.headers,
+        task_id=effective_task_id,
+        chunk_processor=config.chunk_processor,
+        chunk_size=config.chunk_size,
+    )
 
-        if artwork_settings:
-            _process_artwork(file_location, artwork_settings)
+    try:
+        await _download_with_retry(url, file_location, session, effective_config)
     except KeyboardInterrupt:
-        if os.path.isfile(file_location):
+        if file_location.is_file():
             logger.warning('Deleting partially downloaded file "%s"', file_location)
             silentremove(file_location)
         raise KeyboardInterrupt from None
@@ -280,7 +286,7 @@ async def download_file(
             await session.close()
 
 
-def compare_images(image_1: str, image_2: str) -> float:
+def compare_images(image_1: Path, image_2: Path) -> float:
     """Compares two images using root mean square difference.
 
     Args:
@@ -290,7 +296,7 @@ def compare_images(image_1: str, image_2: str) -> float:
     Returns:
         The RMS difference between the two images.
     """
-    with Image.open(image_1) as im1, Image.open(image_2) as im2:
+    with Image.open(str(image_1)) as im1, Image.open(str(image_2)) as im2:
         h = ImageChops.difference(im1, im2).convert("L").histogram()
         return math.sqrt(
             reduce(operator.add, map(lambda h, i: h * (i**2), h, range(256)))
@@ -298,7 +304,7 @@ def compare_images(image_1: str, image_2: str) -> float:
         )
 
 
-def get_image_resolution(image_location: str) -> int:
+def get_image_resolution(image_location: Path) -> int:
     """Gets the width resolution of an image.
 
     Args:
@@ -307,18 +313,18 @@ def get_image_resolution(image_location: str) -> int:
     Returns:
         The width of the image in pixels.
     """
-    with Image.open(image_location) as img:
+    with Image.open(str(image_location)) as img:
         return img.size[0]
 
 
-def silentremove(filename: str) -> None:
+def silentremove(filename: Path) -> None:
     """Removes a file silently, ignoring errors if the file doesn't exist.
 
     Args:
         filename: Path to the file to remove.
     """
     try:
-        os.remove(filename)
+        filename.unlink()
     except OSError as e:
         if e.errno != errno.ENOENT:
             raise
@@ -467,7 +473,7 @@ async def delete_path(path: Path) -> None:
         logger.exception("Failed to delete %s", path)
 
 
-def _move_file_sync(src: str | Path, dst: str | Path) -> bool:
+def _move_file_sync(src: Path, dst: Path) -> bool:
     """Synchronous file move operation.
 
     Args:
@@ -477,21 +483,21 @@ def _move_file_sync(src: str | Path, dst: str | Path) -> bool:
     Returns:
         True if move was performed, False if skipped (same path).
     """
-    src_path = Path(src).resolve()
-    dst_path = Path(dst).resolve()
+    src_resolved = src.resolve()
+    dst_resolved = dst.resolve()
 
     # Skip if source and destination are the same
-    if src_path == dst_path:
+    if src_resolved == dst_resolved:
         return False
 
     # Ensure parent directory exists
-    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    dst_resolved.parent.mkdir(parents=True, exist_ok=True)
 
-    shutil.move(src, dst)
+    shutil.move(str(src), str(dst))
     return True
 
 
-async def move_file(src: str | Path, dst: str | Path) -> None:
+async def move_file(src: Path, dst: Path) -> None:
     """Move a file or directory asynchronously.
 
     This is an async wrapper around shutil.move that runs in a thread pool
@@ -548,3 +554,25 @@ def compress_to_zip(
                             source_path
                         )
                         zf.write(file_path, arcname)
+
+
+def format_duration(seconds: int) -> str:
+    """Formats seconds into a human-readable time string.
+
+    Args:
+        seconds: The number of seconds to format.
+
+    Returns:
+        A formatted time string (e.g., "1d:02h:30m:45s").
+    """
+    time_data = gmtime(seconds)
+    time_format = "%Mm:%Ss"
+
+    if time_data.tm_hour > 0:
+        time_format = "%Hh:" + time_format
+
+    if seconds >= 86400:
+        days = seconds // 86400
+        time_format = f"{days}d:" + time_format
+
+    return strftime(time_format, time_data)

@@ -12,26 +12,54 @@ from typing import Any
 import msgspec
 import platformdirs
 
+# Canonical configuration paths (single source of truth)
+CONFIG_DIR: Path = Path(platformdirs.user_config_dir("Haberlea"))
+SETTINGS_PATH: Path = CONFIG_DIR / "settings.toml"
+SESSION_PATH: Path = CONFIG_DIR / "loginstorage.json"
+NICEGUI_STORAGE_DIR: Path = CONFIG_DIR / "storage"
+
 # =============================================================================
 # Global Settings Structures
 # =============================================================================
 
 
-class GeneralSettings(msgspec.Struct, kw_only=True):
-    """General application settings.
+class RuntimeSettings(msgspec.Struct, kw_only=True):
+    """Runtime environment settings — paths, concurrency, debug.
+
+    Not consumed by the per-track download pipeline directly; used by
+    bootstrap, search, logging, and queue concurrency control.
 
     Attributes:
         download_path: Default download directory path.
-        download_quality: Audio quality tier (minimum/low/medium/high/lossless/hifi).
-        search_limit: Maximum number of search results to return.
         temp_path: Temporary files directory path. Defaults to "" (empty string),
             which triggers fallback to the system temp directory.
+        search_limit: Maximum number of search results to return.
+        concurrent_downloads: Maximum concurrent track downloads.
+        debug_mode: Enable debug logging.
     """
 
-    download_path: str = "./downloads/"
-    download_quality: str = "hifi"
-    search_limit: int = 10
+    download_path: str = "./downloads"
     temp_path: str = ""
+    search_limit: int = 10
+    concurrent_downloads: int = 5
+    debug_mode: bool = False
+
+
+class QualitySettings(msgspec.Struct, kw_only=True):
+    """Audio quality and codec preferences.
+
+    Consumed directly as the quality configuration of TrackDownloader and
+    used to build CodecOptions/QualityEnum passed to modules.
+
+    Attributes:
+        tier: Audio quality tier (minimum/low/medium/high/lossless/hifi).
+        spatial_codecs: Allow spatial audio codecs (Atmos, 360RA, etc.).
+        proprietary_codecs: Allow proprietary codecs (MQA, Dolby, etc.).
+    """
+
+    tier: str = "hifi"
+    spatial_codecs: bool = True
+    proprietary_codecs: bool = False
 
 
 class ArtistDownloadingSettings(msgspec.Struct, kw_only=True):
@@ -68,18 +96,6 @@ class FormattingSettings(msgspec.Struct, kw_only=True):
     force_album_format: bool = False
 
 
-class CodecsSettings(msgspec.Struct, kw_only=True):
-    """Audio codec preference settings.
-
-    Attributes:
-        proprietary_codecs: Allow proprietary codecs (MQA, Dolby, etc.).
-        spatial_codecs: Allow spatial audio codecs (Atmos, 360RA, etc.).
-    """
-
-    proprietary_codecs: bool = False
-    spatial_codecs: bool = True
-
-
 class ModuleDefaultsSettings(msgspec.Struct, kw_only=True):
     """Default module selection for various features.
 
@@ -113,25 +129,28 @@ class CoversSettings(msgspec.Struct, kw_only=True):
 
     Attributes:
         embed_cover: Embed cover art in audio files.
-        restrict_cover_size: Limit cover art file size.
+        compress_embed: If True, process the embedded cover with
+            main_resolution + main_compression (jpg). If False, embed the
+            raw downloaded cover with no processing.
         main_compression: Compression level for embedded covers (low/high).
         main_resolution: Resolution for embedded covers in pixels.
         save_external: Save cover art as separate files.
-        external_format: Format for external cover files (jpg/png/webp).
-        external_compression: Compression for external covers (low/high).
-        external_resolution: Resolution for external covers in pixels.
+        compress_external: If True, compress external covers using the same
+            settings as embedded covers (jpg + main_resolution +
+            main_compression). If False, save the raw downloaded cover with
+            no processing.
         save_animated_cover: Save animated covers when available.
+        cover_variance_threshold: Threshold for cover image comparison.
     """
 
     embed_cover: bool = True
-    restrict_cover_size: bool = False
+    compress_embed: bool = True
     main_compression: str = "high"
     main_resolution: int = 1400
-    save_external: bool = False
-    external_format: str = "png"
-    external_compression: str = "low"
-    external_resolution: int = 3000
+    save_external: bool = True
+    compress_external: bool = False
     save_animated_cover: bool = True
+    cover_variance_threshold: int = 8
 
 
 class PlaylistSettings(msgspec.Struct, kw_only=True):
@@ -139,53 +158,28 @@ class PlaylistSettings(msgspec.Struct, kw_only=True):
 
     Attributes:
         save_m3u: Generate M3U playlist files.
-        paths_m3u: Path type in M3U files (absolute/relative).
         extended_m3u: Use extended M3U format with metadata.
     """
 
     save_m3u: bool = True
-    paths_m3u: str = "absolute"
     extended_m3u: bool = True
 
 
-class AdvancedSettings(msgspec.Struct, kw_only=True):
-    """Advanced configuration settings.
+class DownloadBehaviorSettings(msgspec.Struct, kw_only=True):
+    """Per-track download behavior control settings.
 
     Attributes:
-        advanced_login_system: Use advanced multi-session login system.
-        codec_conversions: Codec conversion mappings (e.g., alac -> flac).
-        conversion_flags: FFmpeg/encoder flags for conversions.
-        conversion_keep_original: Keep original files after conversion.
-        cover_variance_threshold: Threshold for cover image comparison.
-        debug_mode: Enable debug logging.
-        disable_subscription_checks: Skip subscription validation.
         dry_run: Skip actual downloads, only collect track info.
-        enable_undesirable_conversions: Allow lossy-to-lossy conversions.
-        ignore_existing_files: Re-download existing files.
+        download_to_temp: Download to temporary directory first, then move to
+            final location after tagging.
+        force_redownload_existing: Force re-download and overwrite existing files.
         abort_download_when_single_failed: Stop on first track failure.
-        concurrent_downloads: Maximum concurrent track downloads.
-        download_to_temp: Download to temporary directory first, then move to final
-            location after tagging. Provides atomic operations but may be slower
-            on some systems.
     """
 
-    advanced_login_system: bool = False
-    codec_conversions: dict[str, str] = msgspec.field(
-        default_factory=lambda: {"alac": "flac", "wav": "flac"}
-    )
-    conversion_flags: dict[str, dict[str, str]] = msgspec.field(
-        default_factory=lambda: {"flac": {"compression_level": "5"}}
-    )
-    conversion_keep_original: bool = False
-    cover_variance_threshold: int = 8
-    debug_mode: bool = False
-    disable_subscription_checks: bool = False
     dry_run: bool = False
-    enable_undesirable_conversions: bool = False
-    ignore_existing_files: bool = False
-    abort_download_when_single_failed: bool = False
-    concurrent_downloads: int = 5
     download_to_temp: bool = True
+    force_redownload_existing: bool = False
+    abort_download_when_single_failed: bool = False
 
 
 class WebuiSettings(msgspec.Struct, kw_only=True):
@@ -215,32 +209,38 @@ class WebuiSettings(msgspec.Struct, kw_only=True):
 class GlobalSettings(msgspec.Struct, kw_only=True):
     """Complete global settings container.
 
+    Sections are organized to match how they are consumed by the download
+    pipeline. Each section is passed to its corresponding collaborator
+    without field-level repackaging.
+
     Attributes:
-        general: General application settings.
-        artist_downloading: Artist downloading behavior.
+        runtime: Runtime environment (paths, concurrency, debug).
+        quality: Audio quality and codec preferences.
         formatting: File/folder naming formats.
-        codecs: Codec preferences.
-        module_defaults: Default module selections.
-        lyrics: Lyrics handling settings.
         covers: Cover art settings.
-        playlist: Playlist export settings.
-        advanced: Advanced configuration.
+        lyrics: Lyrics handling settings.
+        playlist: Playlist export settings (M3U).
+        download_behavior: Per-track download behavior.
+        artist_downloading: Artist downloading behavior.
+        module_defaults: Default module selections.
         webui: WebUI settings.
     """
 
-    general: GeneralSettings = msgspec.field(default_factory=GeneralSettings)
+    runtime: RuntimeSettings = msgspec.field(default_factory=RuntimeSettings)
+    quality: QualitySettings = msgspec.field(default_factory=QualitySettings)
+    formatting: FormattingSettings = msgspec.field(default_factory=FormattingSettings)
+    covers: CoversSettings = msgspec.field(default_factory=CoversSettings)
+    lyrics: LyricsSettings = msgspec.field(default_factory=LyricsSettings)
+    playlist: PlaylistSettings = msgspec.field(default_factory=PlaylistSettings)
+    download_behavior: DownloadBehaviorSettings = msgspec.field(
+        default_factory=DownloadBehaviorSettings
+    )
     artist_downloading: ArtistDownloadingSettings = msgspec.field(
         default_factory=ArtistDownloadingSettings
     )
-    formatting: FormattingSettings = msgspec.field(default_factory=FormattingSettings)
-    codecs: CodecsSettings = msgspec.field(default_factory=CodecsSettings)
     module_defaults: ModuleDefaultsSettings = msgspec.field(
         default_factory=ModuleDefaultsSettings
     )
-    lyrics: LyricsSettings = msgspec.field(default_factory=LyricsSettings)
-    covers: CoversSettings = msgspec.field(default_factory=CoversSettings)
-    playlist: PlaylistSettings = msgspec.field(default_factory=PlaylistSettings)
-    advanced: AdvancedSettings = msgspec.field(default_factory=AdvancedSettings)
     webui: WebuiSettings = msgspec.field(default_factory=WebuiSettings)
 
 
@@ -309,7 +309,6 @@ def get_default_settings() -> AppSettings:
 
 # Global settings singleton
 _app_settings: AppSettings | None = None
-_settings_path: Path = Path(platformdirs.user_config_dir("Haberlea")) / "settings.toml"
 
 
 class _SettingsProxy:
@@ -320,7 +319,7 @@ class _SettingsProxy:
         """Gets the current global settings, loading if needed."""
         global _app_settings
         if _app_settings is None:
-            _app_settings = load_settings(_settings_path)
+            _app_settings = load_settings(SETTINGS_PATH)
         return _app_settings
 
     @property
@@ -342,26 +341,6 @@ class _SettingsProxy:
 settings = _SettingsProxy()
 
 
-def get_settings_path() -> Path:
-    """Returns the current settings file path.
-
-    Returns:
-        Path to the current settings TOML file.
-    """
-    return _settings_path
-
-
-def set_settings_path(path: Path) -> None:
-    """Sets the settings file path and reloads settings.
-
-    Args:
-        path: Path to the settings TOML file.
-    """
-    global _app_settings, _settings_path
-    _settings_path = path
-    _app_settings = load_settings(path)
-
-
 def set_settings(new_settings: AppSettings) -> None:
     """Sets the global settings directly.
 
@@ -381,5 +360,5 @@ def reload_settings() -> AppSettings:
         The reloaded AppSettings instance.
     """
     global _app_settings
-    _app_settings = load_settings(_settings_path)
+    _app_settings = load_settings(SETTINGS_PATH)
     return _app_settings

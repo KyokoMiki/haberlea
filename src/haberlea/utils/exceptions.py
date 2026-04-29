@@ -266,7 +266,6 @@ class ModuleSettingsNotSet(ConfigurationError):
 
     Attributes:
         setting_name: Name of the missing setting.
-        advanced_mode: Whether advanced login mode is enabled.
         module_name: Name of the module.
     """
 
@@ -274,29 +273,19 @@ class ModuleSettingsNotSet(ConfigurationError):
         self,
         module_name: str,
         setting_name: str,
-        advanced_mode: bool = False,
     ) -> None:
         """Initializes the settings not set error.
 
         Args:
             module_name: Name of the module.
             setting_name: Name of the missing setting.
-            advanced_mode: Whether advanced login mode is enabled.
         """
         self.setting_name = setting_name
-        self.advanced_mode = advanced_mode
 
-        if advanced_mode:
-            message = (
-                f'Setting "{setting_name}" is not set. '
-                f'Use "settings {module_name} adjust_setting {setting_name}" '
-                "to configure it."
-            )
-        else:
-            message = (
-                f'Setting "{setting_name}" is not set. '
-                f"Please add it to the module settings in config/settings.toml."
-            )
+        message = (
+            f'Setting "{setting_name}" is not set. '
+            f"Please add it to the module settings in config/settings.toml."
+        )
         super().__init__(message=message, module_name=module_name)
 
 
@@ -546,36 +535,6 @@ class TagSavingFailure(FileOperationError):
         if file_path:
             msg = f"Failed to save tags to '{file_path}': {reason}"
         super().__init__(msg)
-
-
-class ConversionError(FileOperationError):
-    """Exception raised when audio conversion fails.
-
-    Attributes:
-        source_codec: Source codec name.
-        target_codec: Target codec name.
-        reason: Reason for the failure.
-    """
-
-    def __init__(
-        self,
-        source_codec: str,
-        target_codec: str,
-        reason: str = "Conversion failed",
-    ) -> None:
-        """Initializes the conversion error.
-
-        Args:
-            source_codec: Source codec name.
-            target_codec: Target codec name.
-            reason: Reason for the failure.
-        """
-        self.source_codec = source_codec
-        self.target_codec = target_codec
-        self.reason = reason
-        super().__init__(
-            f"Failed to convert {source_codec} to {target_codec}: {reason}"
-        )
 
 
 # =============================================================================

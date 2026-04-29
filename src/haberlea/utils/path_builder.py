@@ -5,12 +5,11 @@ downloaded music files into appropriate directory structures.
 """
 
 import unicodedata
+from pathlib import Path
 from typing import Any
 
-import msgspec
-
 from .models import AlbumInfo, DownloadTypeEnum, PlaylistInfo, TrackInfo
-from .settings import settings
+from .settings import FormattingSettings
 from .utils import fix_byte_limit, sanitise_name
 
 
@@ -40,6 +39,27 @@ def get_artist_initials(artist_name: str) -> str:
     return initial.upper() if initial.isalpha() else "#"
 
 
+def _sanitise_int(
+    value: int | None,
+    zfill_enabled: bool,
+    zfill_number: int,
+) -> str | None:
+    """Sanitise an optional integer field with optional zero-fill.
+
+    Args:
+        value: The integer value, or None.
+        zfill_enabled: Whether to zero-fill.
+        zfill_number: Number of digits for zero-filling.
+
+    Returns:
+        Sanitised string, or None if value is None.
+    """
+    if value is None:
+        return None
+    s = sanitise_name(str(value))
+    return s.zfill(zfill_number) if zfill_enabled else s
+
+
 def build_track_tags(
     track_info: TrackInfo,
     zfill_enabled: bool,
@@ -55,52 +75,68 @@ def build_track_tags(
     Returns:
         Dictionary of sanitized tags.
     """
-    zfill_fields = {"track_number", "total_tracks", "disc_number", "total_discs"}
+    tags = track_info.tags
+    zf = zfill_enabled
+    zn = zfill_number
 
-    def process_value(key: str, value: Any) -> Any:
-        if value is None:
-            return None
-        if zfill_enabled and key in zfill_fields:
-            return sanitise_name(str(value)).zfill(zfill_number)
-        # Convert non-string values to string before sanitizing
-        if not isinstance(value, str):
-            value = str(value)
-        return sanitise_name(value)
-
-    tags = {
-        k: process_value(k, v) for k, v in msgspec.structs.asdict(track_info).items()
+    return {
+        # TrackInfo fields
+        "name": sanitise_name(track_info.name),
+        "album": sanitise_name(track_info.album),
+        "album_id": sanitise_name(track_info.album_id),
+        "artist": (
+            sanitise_name(track_info.artists[0])
+            if track_info.artists
+            else "Unknown Artist"
+        ),
+        "artists": sanitise_name(", ".join(track_info.artists)),
+        "codec": sanitise_name(str(track_info.codec)),
+        "release_year": sanitise_name(str(track_info.release_year)),
+        "duration": (
+            sanitise_name(str(track_info.duration)) if track_info.duration else None
+        ),
+        "explicit": " [E]" if track_info.explicit else "",
+        "bit_depth": sanitise_name(str(track_info.bit_depth)),
+        "sample_rate": sanitise_name(str(track_info.sample_rate)),
+        "bitrate": (
+            sanitise_name(str(track_info.bitrate)) if track_info.bitrate else None
+        ),
+        # Tags fields
+        "album_artist": (
+            sanitise_name(tags.album_artist) if tags.album_artist else None
+        ),
+        "composer": sanitise_name(tags.composer) if tags.composer else None,
+        "track_number": _sanitise_int(tags.track_number, zf, zn),
+        "total_tracks": _sanitise_int(tags.total_tracks, zf, zn),
+        "disc_number": _sanitise_int(tags.disc_number, zf, zn),
+        "total_discs": _sanitise_int(tags.total_discs, zf, zn),
+        "copyright": sanitise_name(tags.copyright) if tags.copyright else None,
+        "isrc": sanitise_name(tags.isrc) if tags.isrc else None,
+        "upc": sanitise_name(tags.upc) if tags.upc else None,
+        "release_date": (
+            sanitise_name(tags.release_date) if tags.release_date else None
+        ),
+        "description": (sanitise_name(tags.description) if tags.description else None),
+        "comment": sanitise_name(tags.comment) if tags.comment else None,
+        "label": sanitise_name(tags.label) if tags.label else None,
+        "genres": (sanitise_name(", ".join(tags.genres)) if tags.genres else None),
     }
-    # Merge Tags fields directly
-    tags.update(
-        {
-            k: process_value(k, v)
-            for k, v in msgspec.structs.asdict(track_info.tags).items()
-        }
-    )
-    tags["explicit"] = " [E]" if track_info.explicit else ""
-    tags["artist"] = (
-        sanitise_name(track_info.artists[0]) if track_info.artists else "Unknown Artist"
-    )
-    return tags
 
 
 class PathBuilder:
     """Handles path construction for downloads."""
 
-    def __init__(self, base_path: str) -> None:
+    def __init__(self, base_path: Path, formatting: FormattingSettings) -> None:
         """Initialize path builder.
 
         Args:
             base_path: Base download path.
+            formatting: Path formatting configuration.
         """
-        self._base_path = base_path if base_path.endswith("/") else base_path + "/"
+        self.base_path = base_path
+        self._formatting = formatting
 
-    @property
-    def base_path(self) -> str:
-        """Get the base download path."""
-        return self._base_path
-
-    def build_album_path(self, album_id: str, album_info: AlbumInfo) -> str:
+    def build_album_path(self, album_id: str, album_info: AlbumInfo) -> Path:
         """Build album directory path.
 
         Args:
@@ -110,30 +146,41 @@ class PathBuilder:
         Returns:
             Full album directory path.
         """
-        album_tags = {
-            k: sanitise_name(v) for k, v in msgspec.structs.asdict(album_info).items()
+        album_tags: dict[str, Any] = {
+            "name": sanitise_name(album_info.name),
+            "artist": sanitise_name(album_info.artist),
+            "release_year": sanitise_name(str(album_info.release_year)),
+            "id": str(album_id),
+            "quality": f" [{album_info.quality}]" if album_info.quality else "",
+            "explicit": " [E]" if album_info.explicit else "",
+            "artist_initials": get_artist_initials(album_info.artist),
+            "duration": (
+                sanitise_name(str(album_info.duration)) if album_info.duration else None
+            ),
+            "upc": (sanitise_name(album_info.upc) if album_info.upc else None),
+            "description": (
+                sanitise_name(album_info.description)
+                if album_info.description
+                else None
+            ),
         }
-        album_tags["id"] = str(album_id)
-        album_tags["quality"] = f" [{album_info.quality}]" if album_info.quality else ""
-        album_tags["explicit"] = " [E]" if album_info.explicit else ""
-        album_tags["artist_initials"] = get_artist_initials(album_info.artist)
 
         try:
-            album_path = (
-                f"{self._base_path}"
-                f"{settings.global_settings.formatting.album_format.format(**album_tags)}"
+            album_path = self.base_path / self._formatting.album_format.format(
+                **album_tags
             )
         except (KeyError, ValueError):
             # Fallback to safe default format if user format has missing keys
             album_path = (
-                f"{self._base_path}{album_tags['artist']}/"
-                f"{album_tags['name']}{album_tags['explicit']}"
+                self.base_path
+                / album_tags["artist"]
+                / f"{album_tags['name']}{album_tags['explicit']}"
             )
-        album_path = fix_byte_limit(album_path) + "/"
+        album_path = fix_byte_limit(album_path)
 
         return album_path
 
-    def build_playlist_path(self, playlist_info: PlaylistInfo) -> str:
+    def build_playlist_path(self, playlist_info: PlaylistInfo) -> Path:
         """Build playlist directory path.
 
         Args:
@@ -142,32 +189,42 @@ class PathBuilder:
         Returns:
             Full playlist directory path.
         """
-        playlist_tags = {
-            k: sanitise_name(v)
-            for k, v in msgspec.structs.asdict(playlist_info).items()
+        playlist_tags: dict[str, Any] = {
+            "name": sanitise_name(playlist_info.name),
+            "creator": sanitise_name(playlist_info.creator),
+            "release_year": sanitise_name(str(playlist_info.release_year)),
+            "explicit": " [E]" if playlist_info.explicit else "",
+            "duration": (
+                sanitise_name(str(playlist_info.duration))
+                if playlist_info.duration
+                else None
+            ),
+            "description": (
+                sanitise_name(playlist_info.description)
+                if playlist_info.description
+                else None
+            ),
         }
-        playlist_tags["explicit"] = " [E]" if playlist_info.explicit else ""
 
         try:
-            playlist_path = (
-                f"{self._base_path}"
-                f"{settings.global_settings.formatting.playlist_format.format(**playlist_tags)}"
+            playlist_path = self.base_path / self._formatting.playlist_format.format(
+                **playlist_tags
             )
         except (KeyError, ValueError):
             # Fallback to safe default format
             playlist_path = (
-                f"{self._base_path}{playlist_tags['name']}{playlist_tags['explicit']}"
+                self.base_path / f"{playlist_tags['name']}{playlist_tags['explicit']}"
             )
-        playlist_path = fix_byte_limit(playlist_path) + "/"
+        playlist_path = fix_byte_limit(playlist_path)
 
         return playlist_path
 
     def build_track_path(
         self,
         track_info: TrackInfo,
-        album_location: str,
+        album_location: Path,
         download_mode: DownloadTypeEnum,
-    ) -> str:
+    ) -> Path:
         """Build track file path (without extension).
 
         Args:
@@ -185,52 +242,48 @@ class PathBuilder:
         )
         track_tags = build_track_tags(
             track_info,
-            settings.global_settings.formatting.enable_zfill,
+            self._formatting.enable_zfill,
             zfill_number,
         )
 
         if (
             download_mode is DownloadTypeEnum.track
-            and not settings.global_settings.formatting.force_album_format
+            and not self._formatting.force_album_format
         ):
             try:
-                single_fmt = settings.global_settings.formatting.single_full_path_format
-                track_location_name = (
-                    f"{self._base_path}{single_fmt.format(**track_tags)}"
-                )
+                single_fmt = self._formatting.single_full_path_format
+                track_location_name = self.base_path / single_fmt.format(**track_tags)
             except (KeyError, ValueError):
                 # Fallback to safe default format
                 track_location_name = (
-                    f"{self._base_path}{track_tags['artist']}/{track_tags['name']}"
-                    f"{track_tags['explicit']}"
+                    self.base_path
+                    / track_tags["artist"]
+                    / f"{track_tags['name']}{track_tags['explicit']}"
                 )
         elif (
             track_info.tags.total_tracks == 1
-            and not settings.global_settings.formatting.force_album_format
+            and not self._formatting.force_album_format
         ):
             try:
-                single_fmt = settings.global_settings.formatting.single_full_path_format
-                track_location_name = (
-                    f"{album_location}{single_fmt.format(**track_tags)}"
-                )
+                single_fmt = self._formatting.single_full_path_format
+                track_location_name = album_location / single_fmt.format(**track_tags)
             except (KeyError, ValueError):
                 # Fallback to safe default format
                 track_location_name = (
-                    f"{album_location}{track_tags['name']}{track_tags['explicit']}"
+                    album_location / f"{track_tags['name']}{track_tags['explicit']}"
                 )
         else:
             location = album_location
+            disc_prefix = ""
             if track_info.tags.total_discs and track_info.tags.total_discs > 1:
-                location += f"CD {track_info.tags.disc_number}/"
+                disc_prefix = f"{track_info.tags.disc_number}-"
             try:
-                track_location_name = (
-                    f"{location}"
-                    f"{settings.global_settings.formatting.track_filename_format.format(**track_tags)}"
-                )
+                filename = self._formatting.track_filename_format.format(**track_tags)
+                track_location_name = location / (disc_prefix + filename)
             except (KeyError, ValueError):
                 # Fallback to safe default format
                 track_location_name = (
-                    f"{location}{track_tags['track_number']} - "
+                    location / f"{track_tags['track_number']} - "
                     f"{track_tags['name']}{track_tags['explicit']}"
                 )
 

@@ -7,6 +7,7 @@ across different container formats (FLAC, MP3, M4A, OGG, Opus).
 import base64
 import logging
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 import humanfriendly
@@ -22,11 +23,11 @@ from mutagen.mp4 import MP4Cover
 from mutagen.oggopus import OggOpus
 from mutagen.oggvorbis import OggVorbis
 from PIL import Image
-from rich import print
 
 from .utils.exceptions import TagSavingFailure
 from .utils.models import ContainerEnum, CreditsInfo, TrackInfo
-from .utils.settings import settings
+
+logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -50,8 +51,8 @@ class TaggingContext(msgspec.Struct):
         container: Audio container format.
     """
 
-    file_path: str
-    image_path: str | None
+    file_path: Path
+    image_path: Path | None
     track_info: TrackInfo
     credits_list: list[CreditsInfo]
     embedded_lyrics: str
@@ -181,20 +182,19 @@ class BaseTagger(ABC):
         if not self.ctx.image_path:
             return
 
-        with open(self.ctx.image_path, "rb") as f:
+        with open(str(self.ctx.image_path), "rb") as f:
             data = f.read()
 
-        # Get restrict_cover_size from global settings
-        restrict = settings.global_settings.covers.restrict_cover_size
-        max_size = 1023 * 1024 if restrict else 1023 * 1024 * 16
+        # Hard safety cap: most containers/players reject covers above ~16 MiB.
+        max_size = 1023 * 1024 * 16
 
         if len(data) < max_size:
             self._embed_cover(data)
         else:
-            print(
-                f"\tCover file size is too large, only "
-                f"{humanfriendly.format_size(max_size, binary=True)} are allowed. "
-                f"Track will not have cover saved."
+            logger.warning(
+                "Cover file size is too large, only %s are allowed. "
+                "Track will not have cover saved.",
+                humanfriendly.format_size(max_size, binary=True),
             )
 
     def tag(self) -> None:
@@ -238,8 +238,8 @@ class BaseTagger(ABC):
                 self.ctx.embedded_lyrics.split("\n")
             )
 
-        txt_path = self.ctx.file_path.rsplit(".", 1)[0] + "_tags.txt"
-        with open(txt_path, "w", encoding="utf-8") as f:
+        txt_path = self.ctx.file_path.parent / f"{self.ctx.file_path.stem}_tags.txt"
+        with open(str(txt_path), "w", encoding="utf-8") as f:
             f.write(tag_text)
 
         raise TagSavingFailure from error
@@ -262,7 +262,7 @@ class FLACTagger(BaseTagger):
     """Tagger implementation for FLAC files."""
 
     def _create_tagger(self) -> FLAC:
-        tagger = FLAC(self.ctx.file_path)
+        tagger = FLAC(str(self.ctx.file_path))
         if isinstance(tagger.tags, VCFLACDict):
             self._clean_dash_tags(tagger.tags)
         return tagger
@@ -334,7 +334,7 @@ class OggBaseTagger(BaseTagger, ABC):
         picture.mime = "image/jpeg"
 
         if self.ctx.image_path:
-            im = Image.open(self.ctx.image_path)
+            im = Image.open(str(self.ctx.image_path))
             picture.width, picture.height = im.size
             picture.depth = 24
 
@@ -354,7 +354,7 @@ class OggVorbisTagger(OggBaseTagger):
     """Tagger implementation for OGG Vorbis files."""
 
     def _create_tagger(self) -> OggVorbis:
-        tagger = OggVorbis(self.ctx.file_path)
+        tagger = OggVorbis(str(self.ctx.file_path))
         self._clean_dash_tags(tagger.tags)
         return tagger
 
@@ -363,7 +363,7 @@ class OpusTagger(OggBaseTagger):
     """Tagger implementation for Opus files."""
 
     def _create_tagger(self) -> OggOpus:
-        tagger = OggOpus(self.ctx.file_path)
+        tagger = OggOpus(str(self.ctx.file_path))
         self._clean_dash_tags(tagger.tags)
         return tagger
 
@@ -382,12 +382,12 @@ class MP3Tagger(BaseTagger):
             ctx: Tagging context containing all necessary data.
         """
         self.ctx = ctx
-        self._mp3 = MP3(ctx.file_path, ID3=ID3)
+        self._mp3 = MP3(str(ctx.file_path), ID3=ID3)
         if self._mp3.tags is None:
             self._mp3.add_tags()
         self._id3 = self._mp3.tags
         # Create EasyID3 wrapper for simple tags
-        self._easy = EasyMP3(ctx.file_path)
+        self._easy = EasyMP3(str(ctx.file_path))
         if self._easy.tags is None:
             self._easy.tags = EasyID3()
         self._register_easy_keys()
@@ -476,10 +476,10 @@ class MP3Tagger(BaseTagger):
     def _save(self) -> None:
         # Save EasyID3 tags first
         if isinstance(self._easy, EasyMP3):
-            self._easy.save(self.ctx.file_path, v1=2, v2_version=3, v23_sep=None)
+            self._easy.save(str(self.ctx.file_path), v1=2, v2_version=3, v23_sep=None)
         # Then save ID3 tags (APIC, USLT, etc.)
         if self._id3 is not None:
-            self._id3.save(self.ctx.file_path, v1=2, v2_version=3, v23_sep=None)
+            self._id3.save(str(self.ctx.file_path), v1=2, v2_version=3, v23_sep=None)
 
     def _set_replay_gain(self) -> None:
         """MP3 does not support replay gain in the same way."""
@@ -495,7 +495,7 @@ class M4ATagger(BaseTagger):
     """Tagger implementation for M4A files."""
 
     def _create_tagger(self) -> EasyMP4:
-        tagger = EasyMP4(self.ctx.file_path)
+        tagger = EasyMP4(str(self.ctx.file_path))
 
         # Register custom keys
         tagger.RegisterTextKey("isrc", "----:com.apple.itunes:ISRC")
@@ -624,39 +624,19 @@ def create_tagger(ctx: TaggingContext) -> BaseTagger:
     return tagger_class(ctx)
 
 
-def tag_file(
-    file_path: str,
-    image_path: str | None,
-    track_info: TrackInfo,
-    credits_list: list[CreditsInfo],
-    embedded_lyrics: str,
-    container: ContainerEnum,
-) -> None:
+def tag_file(ctx: TaggingContext) -> None:
     """Tags an audio file with metadata.
 
     This is the main entry point for tagging audio files. It creates the
     appropriate tagger based on the container format and applies all metadata.
 
     Args:
-        file_path: Path to the audio file.
-        image_path: Path to the cover image, or None if no cover.
-        track_info: Track metadata information.
-        credits_list: List of credits information.
-        embedded_lyrics: Lyrics to embed in the file.
-        container: Audio container format.
+        ctx: Tagging context containing file path, cover, track info,
+            credits, lyrics, and container format.
 
     Raises:
         TagSavingFailure: If tagging fails.
         ValueError: If the container format is not supported.
     """
-    ctx = TaggingContext(
-        file_path=file_path,
-        image_path=image_path,
-        track_info=track_info,
-        credits_list=credits_list,
-        embedded_lyrics=embedded_lyrics,
-        container=container,
-    )
-
     tagger = create_tagger(ctx)
     tagger.tag()

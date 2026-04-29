@@ -14,6 +14,10 @@ logger = logging.getLogger(__name__)
 SUPPORTED_LANGUAGES = ["zh_CN", "en_US"]
 DEFAULT_LANGUAGE = "zh_CN"
 
+# Source language — msgids are written in this language, so no translation
+# catalog is needed. `_()` returns the msgid as-is for this language.
+SOURCE_LANGUAGE = "en_US"
+
 # Translations directory
 LOCALE_DIR = Path(__file__).parent / "locales"
 
@@ -58,6 +62,10 @@ def _ensure_mo_files() -> None:
     - .mo file is older than .po file
     """
     for lang in SUPPORTED_LANGUAGES:
+        # Skip source language — msgids are already in this language.
+        if lang == SOURCE_LANGUAGE:
+            continue
+
         po_path = LOCALE_DIR / lang / "LC_MESSAGES" / "messages.po"
         mo_path = LOCALE_DIR / lang / "LC_MESSAGES" / "messages.mo"
 
@@ -89,12 +97,27 @@ def init_i18n() -> None:
 
     # Load translations for all supported languages
     for lang in SUPPORTED_LANGUAGES:
+        # Source language: msgids are the source strings — use a no-op
+        # translator that returns msgid unchanged.
+        if lang == SOURCE_LANGUAGE:
+            _translations[lang] = gettext.NullTranslations()
+            logger.debug(f"Using source language as-is for {lang}")
+            continue
+
+        mo_path = LOCALE_DIR / lang / "LC_MESSAGES" / "messages.mo"
+        if not mo_path.exists():
+            logger.warning(
+                f"Missing translation catalog for {lang} at {mo_path}, "
+                "messages will fall back to source language"
+            )
+            _translations[lang] = gettext.NullTranslations()
+            continue
+
         try:
             trans = gettext.translation(
                 "messages",
                 localedir=str(LOCALE_DIR),
                 languages=[lang],
-                fallback=True,
             )
             _translations[lang] = trans
             logger.debug(f"Loaded translations for {lang}")

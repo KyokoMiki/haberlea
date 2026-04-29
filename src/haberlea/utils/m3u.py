@@ -5,6 +5,7 @@ with support for extended M3U format and concurrent write safety.
 """
 
 import os
+from pathlib import Path
 from typing import ClassVar
 
 import anyio
@@ -21,25 +22,22 @@ class M3UPlaylistWriter:
 
     Attributes:
         extended: Whether to use extended M3U format with #EXTINF tags.
-        path_mode: Path mode for track entries ('absolute' or 'relative').
     """
 
     # Class-level lock registry for concurrent access to the same playlist
     _locks: ClassVar[dict[str, anyio.Lock]] = {}
     _locks_lock: ClassVar[anyio.Lock] = anyio.Lock()
 
-    def __init__(self, extended: bool, path_mode: str) -> None:
+    def __init__(self, extended: bool) -> None:
         """Initialize playlist writer.
 
         Args:
             extended: Whether to use extended M3U format with #EXTINF metadata.
-            path_mode: Path mode for track entries ('absolute' or 'relative').
         """
         self.extended = extended
-        self.path_mode = path_mode
 
     @classmethod
-    async def _get_lock(cls, playlist_path: str) -> anyio.Lock:
+    async def _get_lock(cls, playlist_path: Path) -> anyio.Lock:
         """Get or create a lock for a specific playlist file.
 
         Args:
@@ -48,12 +46,13 @@ class M3UPlaylistWriter:
         Returns:
             An anyio.Lock for the specified playlist.
         """
+        key = str(playlist_path)
         async with cls._locks_lock:
-            if playlist_path not in cls._locks:
-                cls._locks[playlist_path] = anyio.Lock()
-            return cls._locks[playlist_path]
+            if key not in cls._locks:
+                cls._locks[key] = anyio.Lock()
+            return cls._locks[key]
 
-    async def create(self, playlist_path: str) -> None:
+    async def create(self, playlist_path: Path) -> None:
         """Create empty playlist file with optional header.
 
         Creates a new M3U playlist file. If extended format is enabled,
@@ -69,9 +68,9 @@ class M3UPlaylistWriter:
 
     async def add_track(
         self,
-        playlist_path: str,
+        playlist_path: Path,
         track_info: TrackInfo,
-        track_location: str,
+        track_location: Path,
     ) -> None:
         """Add a track entry to the playlist.
 
@@ -83,7 +82,7 @@ class M3UPlaylistWriter:
             track_info: Track information containing metadata.
             track_location: Path to the track file.
         """
-        # Build track path based on path_mode
+        # Build relative track path
         track_path = self._build_track_path(playlist_path, track_location)
 
         # Build entry lines
@@ -98,24 +97,23 @@ class M3UPlaylistWriter:
         lock = await self._get_lock(playlist_path)
         async with (
             lock,
-            await anyio.open_file(playlist_path, "a", encoding="utf-8") as f,
+            await anyio.open_file(str(playlist_path), "a", encoding="utf-8") as f,
         ):
             await f.write("\n".join(lines) + "\n")
 
-    def _build_track_path(self, playlist_path: str, track_location: str) -> str:
-        """Build the track path based on path_mode setting.
+    def _build_track_path(self, playlist_path: Path, track_location: Path) -> str:
+        """Build the relative track path for a playlist entry.
 
         Args:
             playlist_path: Path to the playlist file.
-            track_location: Absolute or relative path to the track file.
+            track_location: Path to the track file.
 
         Returns:
-            The formatted track path for the playlist entry.
+            The formatted relative track path for the playlist entry.
         """
-        if self.path_mode == "absolute":
-            return os.path.abspath(track_location)
-        # relative mode
-        return os.path.relpath(track_location, os.path.dirname(playlist_path))
+        # Path.relative_to() only works for subpaths,
+        # so we use os.path.relpath which handles arbitrary paths
+        return os.path.relpath(str(track_location), str(playlist_path.parent))
 
     @classmethod
     async def cleanup_locks(cls) -> None:

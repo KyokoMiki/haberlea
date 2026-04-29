@@ -4,11 +4,11 @@ from typing import TYPE_CHECKING, Any
 
 import msgspec
 
-if TYPE_CHECKING:
-    from haberlea.plugins.base import ExtensionBase, WebUIPageBase
-
 from .exceptions import InvalidInput
 from .utils import read_temporary_setting, set_temporary_setting
+
+if TYPE_CHECKING:
+    from haberlea.plugins.base import ExtensionBase, WebUIPageBase
 
 
 class EncoderEnum(Enum):
@@ -239,6 +239,34 @@ class TemporarySettingsController:
                 value=setting_type,
             )
 
+    def read_session(self) -> dict | None:
+        """Reads the complete session data for the current account.
+
+        Returns:
+            The session dictionary, or None if not found.
+        """
+        return read_temporary_setting(
+            self.settings_location,
+            self.module,
+            session_name=self._get_session_name(),
+        )
+
+    def set_raw(self, root_setting: str, value: Any) -> None:
+        """Sets a root-level setting directly (not nested under custom_data).
+
+        Args:
+            root_setting: The root setting key to set.
+            value: The value to set.
+        """
+        set_temporary_setting(
+            self.settings_location,
+            self.module,
+            root_setting,
+            None,
+            value,
+            session_name=self._get_session_name(),
+        )
+
 
 class ModuleFlags(Flag):
     startup_load = auto()
@@ -279,6 +307,14 @@ class ModuleInformation(msgspec.Struct, kw_only=True):
     test_url: str | None = None
     url_decoding: ManualEnum = ManualEnum.haberlea
     login_behaviour: ManualEnum = ManualEnum.haberlea
+    max_concurrent_downloads: int | None = None
+    # Per-module cap on concurrent track downloads. ``None`` means no extra
+    # limit beyond the global concurrency setting. Use this for modules that
+    # internally parallelise a single track download (e.g. TIDAL).
+    account_autofill_parser: Callable[[str], dict[str, str]] | None = None
+    # Optional parser that converts pasted account-share text into a mapping
+    # of account-config keys to values. When set, the WebUI exposes an
+    # auto-fill button on each account card for this module.
 
 
 class ExtensionInformation(msgspec.Struct):
@@ -323,11 +359,13 @@ class MediaIdentification(msgspec.Struct, kw_only=True):
         media_type: Type of media (track, album, playlist, artist).
         media_id: The media identifier from the service.
         original_url: The original URL that initiated this download request.
+        url_region: Region hint extracted from the URL path (e.g., "us-en").
     """
 
     media_type: DownloadTypeEnum
     media_id: str
     original_url: str = ""
+    url_region: str = ""
 
 
 class QualityEnum(Enum):
@@ -369,7 +407,6 @@ class HabeleaOptions(msgspec.Struct):
     """Global Haberlea options passed to modules."""
 
     debug_mode: bool
-    disable_subscription_check: bool
     quality_tier: QualityEnum  # Here because of subscription checking
     default_cover_options: CoverOptions
 
@@ -423,10 +460,6 @@ class LyricsInfo(msgspec.Struct, kw_only=True):
 
 class CreditsInfo(msgspec.Struct):
     """Credits information for a track.
-
-    Note:
-        This class is deprecated and may be removed in a future version.
-        Consider using a more structured credits representation.
 
     Attributes:
         type: The type of credit (e.g., "composer", "producer").

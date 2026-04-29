@@ -9,7 +9,6 @@ from .exceptions import (
     APIError,
     AuthenticationError,
     ConfigurationError,
-    ConversionError,
     DownloadError,
     DownloadErrorGroup,
     FileOperationError,
@@ -61,7 +60,6 @@ __all__ = [
     "InvalidHashTypeError",
     "FileOperationError",
     "TagSavingFailure",
-    "ConversionError",
     "DownloadErrorGroup",
     "raise_with_context",
     # Temp file management

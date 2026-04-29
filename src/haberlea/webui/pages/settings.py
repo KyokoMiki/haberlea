@@ -1,21 +1,21 @@
 """Settings page for Haberlea WebUI."""
 
-import logging
+from collections.abc import Callable
 from copy import deepcopy
 from typing import Any
 
 from nicegui import ui
 
-from ...core import Haberlea
-from ...i18n import SUPPORTED_LANGUAGES, _, set_language
-from ...utils.settings import (
+from haberlea.i18n import SUPPORTED_LANGUAGES, _, ngettext, set_language
+from haberlea.utils.settings import (
+    SETTINGS_PATH,
     AppSettings,
-    get_settings_path,
     reload_settings,
     save_settings,
     set_settings,
     settings,
 )
+from haberlea.webui.state import get_haberlea
 
 
 class SettingsPage:
@@ -54,33 +54,36 @@ class SettingsPage:
 
             with ui.tabs().classes("w-full") as tabs:
                 ui.tab("general", label=_("General"), icon="settings")
-                ui.tab("formatting", label=_("Formatting"), icon="text_format")
-                ui.tab("codecs", label=_("Codecs"), icon="audiotrack")
-                ui.tab("covers", label=_("Covers"), icon="image")
-                ui.tab("lyrics", label=_("Lyrics"), icon="lyrics")
-                ui.tab("advanced", label=_("Advanced"), icon="tune")
+                ui.tab("output", label=_("Output"), icon="folder")
+                ui.tab("behavior", label=_("Behavior"), icon="tune")
                 ui.tab("webui", label="WebUI", icon="web")
                 ui.tab("modules", label=_("Modules"), icon="extension")
                 ui.tab("extensions", label=_("Extensions"), icon="power")
 
             with ui.tab_panels(tabs, value="general").classes("w-full"):
-                with ui.tab_panel("general"):
-                    self._render_general_settings()
+                with (
+                    ui.tab_panel("general"),
+                    ui.column().classes("w-full gap-4"),
+                ):
+                    self._render_runtime_settings()
+                    self._render_quality_settings()
 
-                with ui.tab_panel("formatting"):
+                with (
+                    ui.tab_panel("output"),
+                    ui.column().classes("w-full gap-4"),
+                ):
                     self._render_formatting_settings()
-
-                with ui.tab_panel("codecs"):
-                    self._render_codec_settings()
-
-                with ui.tab_panel("covers"):
                     self._render_cover_settings()
-
-                with ui.tab_panel("lyrics"):
                     self._render_lyrics_settings()
 
-                with ui.tab_panel("advanced"):
-                    self._render_advanced_settings()
+                with (
+                    ui.tab_panel("behavior"),
+                    ui.column().classes("w-full gap-4"),
+                ):
+                    self._render_download_behavior_settings()
+                    self._render_artist_downloading_settings()
+                    self._render_playlist_settings()
+                    self._render_module_defaults_settings()
 
                 with ui.tab_panel("modules"):
                     self._render_module_settings()
@@ -100,38 +103,71 @@ class SettingsPage:
                     _("Save Settings"), icon="save", on_click=self._save_settings
                 ).props("color=primary")
 
-    def _render_general_settings(self) -> None:
-        """Renders general settings section."""
+    def _render_runtime_settings(self) -> None:
+        """Renders runtime environment settings section."""
         gs = self._edit_settings.global_settings
 
         with ui.card().classes("w-full"):
-            ui.label(_("Download Settings")).classes("text-lg font-semibold mb-4")
+            ui.label(_("Runtime Options")).classes("text-lg font-semibold mb-4")
 
             ui.input(
                 label=_("Download Path"),
-                value=gs.general.download_path,
-            ).classes("w-full mb-2").bind_value(gs.general, "download_path")
+                value=gs.runtime.download_path,
+            ).classes("w-full mb-2").bind_value(gs.runtime, "download_path")
+
+            ui.input(
+                label=_("Temporary Files Path"),
+                value=gs.runtime.temp_path,
+                placeholder=_("Leave empty to use system temp directory"),
+            ).classes("w-full mb-2").bind_value(gs.runtime, "temp_path")
+
+            ui.number(
+                label=_("Search Results Limit"),
+                value=gs.runtime.search_limit,
+                min=1,
+                max=50,
+            ).classes("w-48 mb-2").bind_value(gs.runtime, "search_limit")
+
+            ui.number(
+                label=_("Concurrent Downloads"),
+                value=gs.runtime.concurrent_downloads,
+                min=1,
+                max=10,
+            ).classes("w-48 mb-4").bind_value(gs.runtime, "concurrent_downloads")
+
+            ui.checkbox(
+                _("Debug Mode"),
+                value=gs.runtime.debug_mode,
+            ).bind_value(gs.runtime, "debug_mode")
+
+    def _render_quality_settings(self) -> None:
+        """Renders audio quality and codec preferences section."""
+        gs = self._edit_settings.global_settings
+
+        with ui.card().classes("w-full"):
+            ui.label(_("Quality Options")).classes("text-lg font-semibold mb-4")
 
             ui.select(
                 label=_("Download Quality"),
                 options=["minimum", "low", "medium", "high", "lossless", "hifi"],
-                value=gs.general.download_quality,
-            ).classes("w-48 mb-2").bind_value(gs.general, "download_quality")
+                value=gs.quality.tier,
+            ).classes("w-48 mb-2").bind_value(gs.quality, "tier")
 
-            ui.number(
-                label=_("Search Results Limit"),
-                value=gs.general.search_limit,
-                min=1,
-                max=50,
-            ).classes("w-48").bind_value(gs.general, "search_limit")
+            ui.checkbox(
+                _("Enable Spatial Audio Codecs (Dolby Atmos, etc.)"),
+                value=gs.quality.spatial_codecs,
+            ).bind_value(gs.quality, "spatial_codecs")
 
-            ui.input(
-                label=_("Temporary Files Path"),
-                value=gs.general.temp_path,
-                placeholder=_("Leave empty to use system temp directory"),
-            ).classes("w-full mb-2").bind_value(gs.general, "temp_path")
+            ui.checkbox(
+                _("Enable Proprietary Codecs (MQA, etc.)"),
+                value=gs.quality.proprietary_codecs,
+            ).bind_value(gs.quality, "proprietary_codecs")
 
-        with ui.card().classes("w-full mt-4"):
+    def _render_artist_downloading_settings(self) -> None:
+        """Renders artist downloading behavior section."""
+        gs = self._edit_settings.global_settings
+
+        with ui.card().classes("w-full"):
             ui.label(_("Artist Downloading")).classes("text-lg font-semibold mb-4")
 
             ui.checkbox(
@@ -148,6 +184,51 @@ class SettingsPage:
                 _("Ignore Different Artists"),
                 value=gs.artist_downloading.ignore_different_artists,
             ).bind_value(gs.artist_downloading, "ignore_different_artists")
+
+    def _render_module_defaults_settings(self) -> None:
+        """Renders default third-party module selections section."""
+        gs = self._edit_settings.global_settings
+
+        with ui.card().classes("w-full"):
+            ui.label(_("Module Defaults")).classes("text-lg font-semibold mb-4")
+
+            modules = self._get_available_modules()
+            module_options = ["default"] + modules
+
+            ui.select(
+                label=_("Lyrics Source"),
+                options=module_options,
+                value=gs.module_defaults.lyrics,
+            ).classes("w-48 mb-2").bind_value(gs.module_defaults, "lyrics")
+
+            ui.select(
+                label=_("Covers Source"),
+                options=module_options,
+                value=gs.module_defaults.covers,
+            ).classes("w-48 mb-2").bind_value(gs.module_defaults, "covers")
+
+            ui.select(
+                label=_("Credits Source"),
+                options=module_options,
+                value=gs.module_defaults.credits,
+            ).classes("w-48").bind_value(gs.module_defaults, "credits")
+
+    def _render_playlist_settings(self) -> None:
+        """Renders M3U playlist export settings section."""
+        gs = self._edit_settings.global_settings
+
+        with ui.card().classes("w-full"):
+            ui.label(_("Playlist Settings")).classes("text-lg font-semibold mb-4")
+
+            ui.checkbox(
+                _("Save M3U Playlist"),
+                value=gs.playlist.save_m3u,
+            ).bind_value(gs.playlist, "save_m3u")
+
+            ui.checkbox(
+                _("Extended M3U Format"),
+                value=gs.playlist.extended_m3u,
+            ).bind_value(gs.playlist, "extended_m3u")
 
     def _render_formatting_settings(self) -> None:
         """Renders formatting settings section."""
@@ -191,47 +272,6 @@ class SettingsPage:
                 value=gs.formatting.force_album_format,
             ).bind_value(gs.formatting, "force_album_format")
 
-    def _render_codec_settings(self) -> None:
-        """Renders codec settings section."""
-        gs = self._edit_settings.global_settings
-
-        with ui.card().classes("w-full"):
-            ui.label(_("Codec Options")).classes("text-lg font-semibold mb-4")
-
-            ui.checkbox(
-                _("Enable Proprietary Codecs (MQA, etc.)"),
-                value=gs.codecs.proprietary_codecs,
-            ).bind_value(gs.codecs, "proprietary_codecs")
-
-            ui.checkbox(
-                _("Enable Spatial Audio Codecs (Dolby Atmos, etc.)"),
-                value=gs.codecs.spatial_codecs,
-            ).bind_value(gs.codecs, "spatial_codecs")
-
-        with ui.card().classes("w-full mt-4"):
-            ui.label(_("Module Defaults")).classes("text-lg font-semibold mb-4")
-
-            modules = self._get_available_modules()
-            module_options = ["default"] + modules
-
-            ui.select(
-                label=_("Lyrics Source"),
-                options=module_options,
-                value=gs.module_defaults.lyrics,
-            ).classes("w-48 mb-2").bind_value(gs.module_defaults, "lyrics")
-
-            ui.select(
-                label=_("Covers Source"),
-                options=module_options,
-                value=gs.module_defaults.covers,
-            ).classes("w-48 mb-2").bind_value(gs.module_defaults, "covers")
-
-            ui.select(
-                label=_("Credits Source"),
-                options=module_options,
-                value=gs.module_defaults.credits,
-            ).classes("w-48").bind_value(gs.module_defaults, "credits")
-
     def _render_cover_settings(self) -> None:
         """Renders cover settings section."""
         gs = self._edit_settings.global_settings
@@ -245,9 +285,9 @@ class SettingsPage:
             ).bind_value(gs.covers, "embed_cover")
 
             ui.checkbox(
-                _("Restrict Cover Size"),
-                value=gs.covers.restrict_cover_size,
-            ).bind_value(gs.covers, "restrict_cover_size")
+                _("Compress Embedded Cover"),
+                value=gs.covers.compress_embed,
+            ).bind_value(gs.covers, "compress_embed")
 
             ui.select(
                 label=_("Main Cover Compression"),
@@ -267,29 +307,22 @@ class SettingsPage:
                 value=gs.covers.save_external,
             ).bind_value(gs.covers, "save_external")
 
-            ui.select(
-                label=_("External Cover Format"),
-                options=["jpg", "png", "webp"],
-                value=gs.covers.external_format,
-            ).classes("w-32 mb-2").bind_value(gs.covers, "external_format")
-
-            ui.select(
-                label=_("External Cover Compression"),
-                options=["low", "high"],
-                value=gs.covers.external_compression,
-            ).classes("w-32 mb-2").bind_value(gs.covers, "external_compression")
-
-            ui.number(
-                label=_("External Cover Resolution"),
-                value=gs.covers.external_resolution,
-                min=100,
-                max=5000,
-            ).classes("w-48 mb-4").bind_value(gs.covers, "external_resolution")
+            ui.checkbox(
+                _("Compress External Covers"),
+                value=gs.covers.compress_external,
+            ).bind_value(gs.covers, "compress_external")
 
             ui.checkbox(
                 _("Save Animated Cover"),
                 value=gs.covers.save_animated_cover,
             ).bind_value(gs.covers, "save_animated_cover")
+
+            ui.number(
+                label=_("Cover Variance Threshold"),
+                value=gs.covers.cover_variance_threshold,
+                min=0,
+                max=100,
+            ).classes("w-48 mb-4").bind_value(gs.covers, "cover_variance_threshold")
 
     def _render_lyrics_settings(self) -> None:
         """Renders lyrics settings section."""
@@ -313,90 +346,32 @@ class SettingsPage:
                 value=gs.lyrics.save_synced_lyrics,
             ).bind_value(gs.lyrics, "save_synced_lyrics")
 
-        with ui.card().classes("w-full mt-4"):
-            ui.label(_("Playlist Settings")).classes("text-lg font-semibold mb-4")
-
-            ui.checkbox(
-                _("Save M3U Playlist"),
-                value=gs.playlist.save_m3u,
-            ).bind_value(gs.playlist, "save_m3u")
-
-            ui.select(
-                label=_("M3U Path Type"),
-                options=["absolute", "relative"],
-                value=gs.playlist.paths_m3u,
-            ).classes("w-32 mb-2").bind_value(gs.playlist, "paths_m3u")
-
-            ui.checkbox(
-                _("Extended M3U Format"),
-                value=gs.playlist.extended_m3u,
-            ).bind_value(gs.playlist, "extended_m3u")
-
-    def _render_advanced_settings(self) -> None:
-        """Renders advanced settings section."""
+    def _render_download_behavior_settings(self) -> None:
+        """Renders download behavior settings section."""
         gs = self._edit_settings.global_settings
 
         with ui.card().classes("w-full"):
-            ui.label(_("Advanced Settings")).classes("text-lg font-semibold mb-4")
-
-            ui.number(
-                label=_("Concurrent Downloads"),
-                value=gs.advanced.concurrent_downloads,
-                min=1,
-                max=10,
-            ).classes("w-48 mb-4").bind_value(gs.advanced, "concurrent_downloads")
+            ui.label(_("Download Behavior")).classes("text-lg font-semibold mb-4")
 
             ui.checkbox(
                 _("Dry Run (Collect info only, no download)"),
-                value=gs.advanced.dry_run,
-            ).bind_value(gs.advanced, "dry_run")
-
-            ui.checkbox(
-                _("Debug Mode"),
-                value=gs.advanced.debug_mode,
-            ).bind_value(gs.advanced, "debug_mode")
-
-            ui.checkbox(
-                _("Ignore Existing Files"),
-                value=gs.advanced.ignore_existing_files,
-            ).bind_value(gs.advanced, "ignore_existing_files")
-
-            ui.checkbox(
-                _("Disable Subscription Checks"),
-                value=gs.advanced.disable_subscription_checks,
-            ).bind_value(gs.advanced, "disable_subscription_checks")
-
-            ui.checkbox(
-                _("Abort Download When Single Failed"),
-                value=gs.advanced.abort_download_when_single_failed,
-            ).bind_value(gs.advanced, "abort_download_when_single_failed")
-
-            ui.checkbox(
-                _("Enable Undesirable Conversions (lossy to lossy)"),
-                value=gs.advanced.enable_undesirable_conversions,
-            ).bind_value(gs.advanced, "enable_undesirable_conversions")
-
-            ui.checkbox(
-                _("Advanced Login System"),
-                value=gs.advanced.advanced_login_system,
-            ).bind_value(gs.advanced, "advanced_login_system")
-
-            ui.checkbox(
-                _("Keep Original After Conversion"),
-                value=gs.advanced.conversion_keep_original,
-            ).bind_value(gs.advanced, "conversion_keep_original")
-
-            ui.number(
-                label=_("Cover Variance Threshold"),
-                value=gs.advanced.cover_variance_threshold,
-                min=0,
-                max=100,
-            ).classes("w-48 mb-4").bind_value(gs.advanced, "cover_variance_threshold")
+                value=gs.download_behavior.dry_run,
+            ).bind_value(gs.download_behavior, "dry_run")
 
             ui.checkbox(
                 _("Download to Temp Directory First"),
-                value=gs.advanced.download_to_temp,
-            ).bind_value(gs.advanced, "download_to_temp")
+                value=gs.download_behavior.download_to_temp,
+            ).bind_value(gs.download_behavior, "download_to_temp")
+
+            ui.checkbox(
+                _("Force Re-download Existing Files"),
+                value=gs.download_behavior.force_redownload_existing,
+            ).bind_value(gs.download_behavior, "force_redownload_existing")
+
+            ui.checkbox(
+                _("Abort Download When Single Failed"),
+                value=gs.download_behavior.abort_download_when_single_failed,
+            ).bind_value(gs.download_behavior, "abort_download_when_single_failed")
 
     def _render_webui_settings(self) -> None:
         """Renders WebUI settings section."""
@@ -484,16 +459,9 @@ class SettingsPage:
             return
 
         for module_name, accounts in modules.items():
-            # Handle both old dict format and new list format for compatibility
-            if isinstance(accounts, dict):
-                logging.getLogger(__name__).warning(
-                    "Module '%s' uses legacy dict format, migrating to list format",
-                    module_name,
-                )
-                accounts = [accounts]
-
             with ui.expansion(
-                f"{module_name.upper()} ({len(accounts)} 个账号)",
+                f"{module_name.upper()} ({len(accounts)} "
+                f"{ngettext('account', 'accounts', len(accounts))})",
                 icon="extension",
             ).classes("w-full mb-2") as expansion:
                 # Store expansion reference for updating title later
@@ -530,12 +498,35 @@ class SettingsPage:
     ) -> None:
         """Renders input fields for a single account configuration.
 
+        Renders built-in fields (name, region) first with translated labels,
+        then module-specific fields.
+
         Args:
             module_name: Name of the module.
             account_index: Index of the account in the accounts list.
             account_config: Account configuration dictionary.
         """
+        builtin_keys = ("name", "region")
+        builtin_labels = {
+            "name": _("Display Name"),
+            "region": _("Region Tag"),
+        }
+
+        # Render builtin fields first
+        for key in builtin_keys:
+            if key in account_config:
+                ui.input(
+                    label=builtin_labels.get(key, key),
+                    value=str(account_config[key]) if account_config[key] else "",
+                    on_change=lambda e, m=module_name, idx=account_index, k=key: (
+                        self._set_module_account_value(m, idx, k, e.value)
+                    ),
+                ).classes("w-full mb-2")
+
+        # Render module-specific fields
         for key, value in account_config.items():
+            if key in builtin_keys:
+                continue
             if isinstance(value, bool):
                 ui.checkbox(
                     key,
@@ -584,16 +575,36 @@ class SettingsPage:
         """
         card = ui.card().classes("w-full mb-2")
         with card:
+            account_name = account_config.get("name", "")
+            account_region = account_config.get("region", "")
+            if account_name:
+                title = f"{_('Account')} {account_index + 1} - {account_name}"
+            else:
+                title = f"{_('Account')} {account_index + 1}"
+
             with ui.row().classes("w-full justify-between items-center"):
-                ui.label(f"{_('Account')} {account_index + 1}").classes(
-                    "text-sm font-semibold text-gray-600"
-                )
-                ui.button(
-                    icon="delete",
-                    on_click=lambda _, m=module_name, idx=account_index: (
-                        self._delete_account(m, idx)
-                    ),
-                ).props("flat dense color=negative").tooltip(_("Delete this account"))
+                with ui.row().classes("items-center gap-2"):
+                    ui.label(title).classes("text-sm font-semibold text-gray-600")
+                    if account_region:
+                        ui.badge(account_region, color="blue").props("outline")
+                with ui.row().classes("items-center gap-1"):
+                    if self._get_autofill_parser(module_name) is not None:
+                        ui.button(
+                            icon="auto_fix_high",
+                            on_click=lambda _, m=module_name, idx=account_index: (
+                                self._open_autofill_dialog(m, idx)
+                            ),
+                        ).props("flat dense color=primary").tooltip(
+                            _("Auto-fill from pasted text")
+                        )
+                    ui.button(
+                        icon="delete",
+                        on_click=lambda _, m=module_name, idx=account_index: (
+                            self._delete_account(m, idx)
+                        ),
+                    ).props("flat dense color=negative").tooltip(
+                        _("Delete this account")
+                    )
             self._render_account_fields(module_name, account_index, account_config)
 
         self._account_cards[module_name].append(card)
@@ -642,6 +653,10 @@ class SettingsPage:
             else:
                 new_account[key] = ""
 
+        # Ensure builtin fields are always present
+        new_account.setdefault("name", "")
+        new_account.setdefault("region", "")
+
         accounts.append(new_account)
         new_index = len(accounts) - 1
 
@@ -672,28 +687,129 @@ class SettingsPage:
 
         if account_index < len(accounts):
             accounts.pop(account_index)
-
-            # Clear all cards for this module
-            cards = self._account_cards.get(module_name, [])
-            for card in cards:
-                card.delete()
-            self._account_cards[module_name] = []
-
-            # Rebuild all account cards with correct indices
-            container = self._account_containers.get(module_name)
-            if container is not None:
-                with container:
-                    for idx, account_config in enumerate(accounts):
-                        self._create_account_card(module_name, idx, account_config)
+            self._rebuild_account_cards(module_name)
 
             # Update expansion title
             expansion = self._module_expansions.get(module_name)
             if expansion is not None:
                 expansion.props(
-                    f'label="{module_name.upper()} ({len(accounts)} 个账号)"'
+                    f'label="{module_name.upper()} ({len(accounts)} '
+                    f'{ngettext("account", "accounts", len(accounts))})"'
                 )
 
             ui.notify(_("Account deleted"), type="positive")
+
+    def _rebuild_account_cards(self, module_name: str) -> None:
+        """Rebuilds all account cards for a module from current edit settings.
+
+        Args:
+            module_name: Name of the module whose cards should be rebuilt.
+        """
+        accounts = self._edit_settings.modules.get(module_name, [])
+        for card in self._account_cards.get(module_name, []):
+            card.delete()
+        self._account_cards[module_name] = []
+
+        container = self._account_containers.get(module_name)
+        if container is None:
+            return
+        with container:
+            for idx, account_config in enumerate(accounts):
+                self._create_account_card(module_name, idx, account_config)
+
+    def _get_autofill_parser(
+        self, module_name: str
+    ) -> Callable[[str], dict[str, str]] | None:
+        """Returns the auto-fill text parser for a module, if any.
+
+        Looks up the parser declared on the module's ``ModuleInformation``
+        via the registry. Returns ``None`` when the registry is unavailable
+        or the module did not register a parser.
+
+        Args:
+            module_name: Name of the module.
+
+        Returns:
+            The parser callable, or ``None`` when none is configured.
+        """
+        try:
+            haberlea = get_haberlea()
+        except Exception:
+            return None
+        info = haberlea.module_registry.state.module_settings.get(module_name)
+        if info is None:
+            return None
+        return info.account_autofill_parser
+
+    def _open_autofill_dialog(self, module_name: str, account_index: int) -> None:
+        """Opens a dialog to auto-fill account fields from pasted text.
+
+        Args:
+            module_name: Name of the module.
+            account_index: Index of the account to fill.
+        """
+        modules = self._edit_settings.modules
+        if module_name not in modules or account_index >= len(modules[module_name]):
+            return
+
+        with ui.dialog() as dialog, ui.card().classes("w-[32rem]"):
+            ui.label(_("Auto-fill account from text")).classes("text-lg font-semibold")
+            ui.label(
+                _(
+                    "Paste account info. Recognized labels: "
+                    "Token, User ID, Email, Region, App ID, App Secret, Name."
+                )
+            ).classes("text-sm text-gray-500")
+            textarea = ui.textarea().classes("w-full").props("rows=10 outlined")
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button(_("Cancel"), on_click=dialog.close).props("flat")
+                ui.button(
+                    _("Apply"),
+                    on_click=lambda: self._apply_autofill(
+                        module_name, account_index, textarea.value or "", dialog
+                    ),
+                ).props("color=primary")
+        dialog.open()
+
+    def _apply_autofill(
+        self,
+        module_name: str,
+        account_index: int,
+        text: str,
+        dialog: ui.dialog,
+    ) -> None:
+        """Parses pasted text and applies recognized fields to the account.
+
+        Args:
+            module_name: Name of the module.
+            account_index: Index of the account to fill.
+            text: Pasted text to parse.
+            dialog: The dialog instance to close on success.
+        """
+        modules = self._edit_settings.modules
+        if module_name not in modules or account_index >= len(modules[module_name]):
+            return
+
+        parser = self._get_autofill_parser(module_name)
+        if parser is None:
+            return
+
+        account_config = modules[module_name][account_index]
+        valid_keys = set(account_config.keys())
+        parsed = {k: v for k, v in parser(text).items() if k in valid_keys}
+        if not parsed:
+            ui.notify(_("No recognizable fields found"), type="warning")
+            return
+
+        for key, value in parsed.items():
+            account_config[key] = value
+
+        self._rebuild_account_cards(module_name)
+        dialog.close()
+        ui.notify(
+            _("Auto-filled: {fields}").format(fields=", ".join(parsed.keys())),
+            type="positive",
+        )
 
     def _clear_module_session(self, module_name: str) -> None:
         """Clears session data for a module, forcing re-login.
@@ -701,7 +817,7 @@ class SettingsPage:
         Args:
             module_name: Name of the module to clear session for.
         """
-        haberlea = Haberlea()
+        haberlea = get_haberlea()
         if haberlea.clear_module_session(module_name):
             ui.notify(
                 _("Login data cleared, will re-login on next use"),
@@ -721,7 +837,7 @@ class SettingsPage:
     def _save_settings(self) -> None:
         """Saves edit settings to file and updates global singleton."""
         set_settings(self._edit_settings)
-        save_settings(get_settings_path(), self._edit_settings)
+        save_settings(SETTINGS_PATH, self._edit_settings)
         ui.notify(_("Settings saved"), type="positive")
 
     def _reload_settings(self) -> None:
@@ -816,7 +932,7 @@ class SettingsPage:
                 label=label,
                 value=value,
                 on_change=lambda e, t=ext_type, n=ext_name, k=key: (
-                    self._set_extension_value(t, n, k, int(e.value))
+                    self._set_extension_value(t, n, k, int(e.value or 0))
                 ),
             ).classes("w-full mb-2")
         else:

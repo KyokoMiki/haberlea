@@ -7,15 +7,19 @@ Built with asyncclick for Python 3.14+, featuring:
 - Rich help text generation
 """
 
-import os
+import logging
 import re
 from pathlib import Path
 from urllib.parse import urlparse
 
 import asyncclick as click
+import msgspec
+from rich.logging import RichHandler
 
-from .core import Haberlea, haberlea_core_download
-from .music_downloader import format_duration
+from .core import Haberlea, cleanup_modules, haberlea_core_download
+from .core.bootstrap import bootstrap, persist_and_check, reconcile
+from .downloader.contexts import DownloadRequest
+from .downloader.results import DownloadSummary
 from .utils.models import (
     DownloadTypeEnum,
     ManualEnum,
@@ -25,17 +29,18 @@ from .utils.models import (
     SearchResult,
 )
 from .utils.progress import RichProgressCallback, clear_all, set_callback
-from .utils.settings import reload_settings, settings
+from .utils.settings import SETTINGS_PATH, settings
+from .utils.utils import format_duration
 
 # CLI configuration constants
 MEDIA_TYPES = tuple(t.name for t in DownloadTypeEnum if t.name is not None)
 MEDIA_TYPES_STR = "/".join(MEDIA_TYPES)
 
 BANNER = r'''
-  _  _     ___     ___     ___     ___     _       ___     ___  
- | || |   / _ \   | _ )   | __|   | _ \   | |     | __|   / _ \ 
- | __ |   | _ |   | _ \   | _|    |   /   | |__   | _|    | _ | 
- |_||_|   |_|_|   |___/   |___|   |_|_\   |____|  |___|   |_|_| 
+  _  _     ___     ___     ___     ___     _       ___     ___
+ | || |   / _ \   | _ )   | __|   | _ \   | |     | __|   / _ \
+ | __ |   | _ |   | _ \   | _|    |   /   | |__   | _|    | _ |
+ |_||_|   |_|_|   |___/   |___|   |_|_\   |____|  |___|   |_|_|
 _|"""""|_|"""""|_|"""""|_|"""""|_|"""""|_|"""""|_|"""""|_|"""""|
 "`-0-0-'"`-0-0-'"`-0-0-'"`-0-0-'"`-0-0-'"`-0-0-'"`-0-0-'"`-0-0-'
 '''
@@ -57,10 +62,13 @@ def get_visible_modules(haberlea: Haberlea) -> list[str]:
     """
     return [
         name
-        for name in haberlea.module_list
+        for name in haberlea.module_registry.state.module_list
         if (
-            haberlea.module_settings[name].flags is None
-            or not (haberlea.module_settings[name].flags & ModuleFlags.hidden)
+            haberlea.module_registry.state.module_settings[name].flags is None
+            or not (
+                haberlea.module_registry.state.module_settings[name].flags
+                & ModuleFlags.hidden
+            )
         )
     ]
 
@@ -79,7 +87,7 @@ def validate_module_name(haberlea: Haberlea, module_name: str) -> str:
         click.BadParameter: If module name is invalid.
     """
     module_name = module_name.lower()
-    if module_name not in haberlea.module_list:
+    if module_name not in haberlea.module_registry.state.module_list:
         visible = get_visible_modules(haberlea)
         raise click.BadParameter(
             f'Unknown module "{module_name}". Available: {", ".join(visible)}'
@@ -180,9 +188,10 @@ async def resolve_urls_to_media(
 
         # Find matching module for URL
         service_name: str | None = None
-        for pattern in haberlea.module_netloc_constants:
+        netloc_map = haberlea.module_registry.state.module_netloc_constants
+        for pattern in netloc_map:
             if re.search(pattern, url.netloc):
-                service_name = haberlea.module_netloc_constants[pattern]
+                service_name = netloc_map[pattern]
                 break
 
         if not service_name:
@@ -193,7 +202,7 @@ async def resolve_urls_to_media(
         if service_name not in media_to_download:
             media_to_download[service_name] = []
 
-        module_settings = haberlea.module_settings[service_name]
+        module_settings = haberlea.module_registry.state.module_settings[service_name]
 
         # Handle manual URL decoding
         if module_settings.url_decoding is ManualEnum.manual:
@@ -237,8 +246,8 @@ async def run_download_with_progress(
     media_to_download: dict[str, list[MediaIdentification]],
     tpm: dict[ModuleModes, str],
     sdm: str,
-    output_path: str,
-) -> tuple[list[str], list[tuple[str, str]]]:
+    output_path: Path,
+) -> DownloadSummary:
     """Runs download with Rich progress display.
 
     Args:
@@ -249,24 +258,42 @@ async def run_download_with_progress(
         output_path: Output directory path.
 
     Returns:
-        Tuple of (completed track IDs, failed track IDs with errors).
+        DownloadSummary with completed and failed track details.
     """
     with RichProgressCallback() as progress:
         set_callback(progress)
         try:
-            completed, failed = await haberlea_core_download(
-                haberlea, media_to_download, tpm, sdm, output_path
+            summary = await haberlea_core_download(
+                DownloadRequest(
+                    session=haberlea,
+                    media_to_download=media_to_download,
+                    third_party_modules=tpm,
+                    separate_download_module=sdm,
+                    output_path=output_path,
+                )
             )
         finally:
             set_callback(None)
             clear_all()
 
-    return completed, failed
+    return summary
+
+
+def configure_logging() -> None:
+    """Configures logging based on debug mode setting."""
+    level = (
+        logging.DEBUG if settings.global_settings.runtime.debug_mode else logging.INFO
+    )
+    logging.basicConfig(
+        level=level,
+        format="%(message)s",
+        datefmt="[%X]",
+        handlers=[RichHandler(rich_tracebacks=True, show_path=False)],
+    )
 
 
 def init_haberlea_context(
     ctx: click.Context,
-    private: bool,
     output: Path | None,
     lyrics: str,
     covers: str,
@@ -275,22 +302,34 @@ def init_haberlea_context(
 ) -> None:
     """Initializes Haberlea and stores context for subcommands.
 
+    Uses the three-phase bootstrap → reconcile → persist pipeline.
+
     Args:
         ctx: Click context.
-        private: Enable private modules only.
         output: Output path override.
         lyrics: Lyrics module override.
         covers: Covers module override.
         credits: Credits module override.
         separate_download: Separate download module.
     """
-    # Initialize Haberlea core
-    haberlea = Haberlea(private)
+    # Three-phase initialization
+    bootstrap_result = bootstrap()
+    configure_logging()
+
+    reconcile_result = reconcile(bootstrap_result, settings.current)
+    has_new = persist_and_check(reconcile_result)
+
+    if has_new:
+        click.echo(
+            f"New settings detected, or the configuration has been reset. "
+            f"Please update settings file: {SETTINGS_PATH}"
+        )
+        raise SystemExit(0)
+
+    haberlea = Haberlea.from_reconciled(bootstrap_result, reconcile_result)
 
     # Resolve output path
-    output_path = output or Path(settings.global_settings.general.download_path)
-    if str(output_path).endswith("/"):
-        output_path = Path(str(output_path)[:-1])
+    output_path = output or Path(settings.global_settings.runtime.download_path)
     output_path.mkdir(parents=True, exist_ok=True)
 
     # Build third-party module mapping (using ModuleModes as keys)
@@ -334,13 +373,6 @@ def init_haberlea_context(
 
 @click.group(invoke_without_command=True)
 @click.option(
-    "-p",
-    "--private",
-    is_flag=True,
-    hidden=True,
-    help="Enable private modules only.",
-)
-@click.option(
     "-o",
     "--output",
     type=click.Path(path_type=Path),
@@ -374,7 +406,6 @@ def init_haberlea_context(
 @click.pass_context
 async def cli(
     ctx: click.Context,
-    private: bool,
     output: Path | None,
     lyrics: str,
     covers: str,
@@ -396,7 +427,6 @@ async def cli(
     # Store CLI options for lazy initialization
     ctx.ensure_object(dict)
     ctx.obj["_cli_options"] = {
-        "private": private,
         "output": output,
         "lyrics": lyrics,
         "covers": covers,
@@ -422,7 +452,6 @@ def ensure_haberlea(ctx: click.Context) -> None:
     opts = ctx.obj["_cli_options"]
     init_haberlea_context(
         ctx,
-        opts["private"],
         opts["output"],
         opts["lyrics"],
         opts["covers"],
@@ -432,22 +461,35 @@ def ensure_haberlea(ctx: click.Context) -> None:
     ctx.obj["_initialized"] = True
 
 
+class CliContext(msgspec.Struct, frozen=True):
+    """CLI context objects extracted from click context.
+
+    Replaces: tuple[Haberlea, Path, dict[ModuleModes, str], str]
+    """
+
+    haberlea: Haberlea
+    output_path: Path
+    third_party_modules: dict[ModuleModes, str]
+    separate_download: str
+
+
 def extract_context_objects(
     ctx: click.Context,
-) -> tuple[Haberlea, Path, dict[ModuleModes, str], str]:
+) -> CliContext:
     """Extracts common context objects for commands.
 
     Args:
         ctx: Click context.
 
     Returns:
-        Tuple of (haberlea, output_path, third_party_modules, separate_download).
+        CliContext with haberlea, output_path, third_party_modules, separate_download.
     """
-    haberlea: Haberlea = ctx.obj["haberlea"]
-    output_path: Path = ctx.obj["output_path"]
-    tpm: dict[ModuleModes, str] = ctx.obj["third_party_modules"]
-    sdm: str = ctx.obj["separate_download"]
-    return haberlea, output_path, tpm, sdm
+    return CliContext(
+        haberlea=ctx.obj["haberlea"],
+        output_path=ctx.obj["output_path"],
+        third_party_modules=ctx.obj["third_party_modules"],
+        separate_download=ctx.obj["separate_download"],
+    )
 
 
 # =============================================================================
@@ -460,6 +502,17 @@ def version_command() -> None:
     """Show Haberlea version information."""
     click.echo("Haberlea v0.1.0")
     click.echo("Modular music archival tool")
+
+
+@cli.command("settings")
+def settings_command() -> None:
+    """Open settings.toml in your default editor."""
+    settings_path = SETTINGS_PATH
+
+    if not settings_path.exists():
+        raise click.ClickException(f"Settings file not found: {settings_path}")
+
+    click.edit(filename=str(settings_path))
 
 
 # =============================================================================
@@ -485,21 +538,27 @@ async def download_urls(
     """
     ensure_haberlea(ctx)
 
-    haberlea: Haberlea = ctx.obj["haberlea"]
-    output_path: Path = ctx.obj["output_path"]
-    tpm: dict[ModuleModes, str] = ctx.obj["third_party_modules"]
-    sdm: str = ctx.obj["separate_download"]
+    cli_ctx = extract_context_objects(ctx)
 
     # Handle file input (list of URLs in a file)
-    if len(urls) == 1 and os.path.isfile(urls[0]):
+    if len(urls) == 1 and Path(urls[0]).is_file():
         with open(urls[0], encoding="utf-8") as f:
             urls = tuple(line.strip() for line in f if line.strip())
 
     if not urls:
         raise click.ClickException("No URLs provided.")
 
-    # All downloads now use the global concurrent queue
-    await _download_sequential(haberlea, urls, tpm, sdm, output_path)
+    try:
+        # All downloads now use the global concurrent queue
+        await _download_sequential(
+            cli_ctx.haberlea,
+            urls,
+            cli_ctx.third_party_modules,
+            cli_ctx.separate_download,
+            cli_ctx.output_path,
+        )
+    finally:
+        await cleanup_modules(cli_ctx.haberlea)
 
 
 async def _download_sequential(
@@ -520,16 +579,16 @@ async def _download_sequential(
     """
     media_to_download = await resolve_urls_to_media(haberlea, urls)
 
-    completed, failed = await run_download_with_progress(
-        haberlea, media_to_download, tpm, sdm, str(output_path)
+    summary = await run_download_with_progress(
+        haberlea, media_to_download, tpm, sdm, output_path
     )
 
-    if completed:
-        click.echo(f"\nCompleted: {len(completed)} tracks")
-    if failed:
-        click.echo(f"Failed: {len(failed)} tracks")
-        for track_id, error in failed:
-            click.echo(f"  - {track_id}: {error}")
+    if summary.completed:
+        click.echo(f"\nCompleted: {len(summary.completed)} tracks")
+    if summary.failed:
+        click.echo(f"Failed: {len(summary.failed)} tracks")
+        for ft in summary.failed:
+            click.echo(f"  - {ft.track_id}: {ft.reason}")
 
 
 # =============================================================================
@@ -570,16 +629,16 @@ async def search_command(
     """
     ensure_haberlea(ctx)
 
-    haberlea, output_path, tpm, sdm = extract_context_objects(ctx)
+    cli_ctx = extract_context_objects(ctx)
 
     # Validate inputs
-    module = validate_module_name(haberlea, module)
+    module = validate_module_name(cli_ctx.haberlea, module)
     query_type = validate_media_type(media_type)
     query_str = " ".join(query)
 
     # Load module and perform search
-    loaded_module = await haberlea.load_module(module)
-    search_limit = 1 if lucky else settings.global_settings.general.search_limit
+    loaded_module = await cli_ctx.haberlea.load_module(module)
+    search_limit = 1 if lucky else settings.global_settings.runtime.search_limit
 
     items = await loaded_module.search(query_type, query_str, limit=search_limit)
 
@@ -620,14 +679,18 @@ async def search_command(
         ]
     }
 
-    completed, failed = await run_download_with_progress(
-        haberlea, media_to_download, tpm, sdm, str(output_path)
+    summary = await run_download_with_progress(
+        cli_ctx.haberlea,
+        media_to_download,
+        cli_ctx.third_party_modules,
+        cli_ctx.separate_download,
+        cli_ctx.output_path,
     )
 
-    if completed:
-        click.echo(f"\nCompleted: {len(completed)} tracks")
-    if failed:
-        click.echo(f"Failed: {len(failed)} tracks")
+    if summary.completed:
+        click.echo(f"\nCompleted: {len(summary.completed)} tracks")
+    if summary.failed:
+        click.echo(f"Failed: {len(summary.failed)} tracks")
 
 
 # =============================================================================
@@ -661,10 +724,10 @@ async def download_command(
     """
     ensure_haberlea(ctx)
 
-    haberlea, output_path, tpm, sdm = extract_context_objects(ctx)
+    cli_ctx = extract_context_objects(ctx)
 
     # Validate inputs
-    module = validate_module_name(haberlea, module)
+    module = validate_module_name(cli_ctx.haberlea, module)
     download_type = validate_media_type(media_type)
 
     media_to_download = {
@@ -678,251 +741,43 @@ async def download_command(
         ]
     }
 
-    completed, failed = await run_download_with_progress(
-        haberlea, media_to_download, tpm, sdm, str(output_path)
+    summary = await run_download_with_progress(
+        cli_ctx.haberlea,
+        media_to_download,
+        cli_ctx.third_party_modules,
+        cli_ctx.separate_download,
+        cli_ctx.output_path,
     )
 
-    if completed:
-        click.echo(f"\nCompleted: {len(completed)} tracks")
-    if failed:
-        click.echo(f"Failed: {len(failed)} tracks")
+    if summary.completed:
+        click.echo(f"\nCompleted: {len(summary.completed)} tracks")
+    if summary.failed:
+        click.echo(f"Failed: {len(summary.failed)} tracks")
 
 
 # =============================================================================
-# Modules Command
+# Clear Session Command
 # =============================================================================
 
 
-@cli.command("modules")
+@cli.command("clear")
+@click.argument("module")
 @click.pass_context
-async def list_modules(ctx: click.Context) -> None:
-    """List all available modules."""
-    ensure_haberlea(ctx)
-
-    haberlea: Haberlea = ctx.obj["haberlea"]
-
-    click.echo("Available modules:")
-    for module_name in sorted(get_visible_modules(haberlea)):
-        info = haberlea.module_settings[module_name]
-        click.echo(f"  {module_name}: {info.service_name}")
-
-
-# =============================================================================
-# Settings Command Group
-# =============================================================================
-
-
-@cli.group("settings")
-@click.pass_context
-async def settings_group(ctx: click.Context) -> None:
-    """Manage Haberlea settings and modules.
+async def clear_session(ctx: click.Context, module: str) -> None:
+    """Clear session data for a module to force re-login.
 
     \b
     Examples:
-        haberlea settings refresh
-        haberlea settings modules
-        haberlea settings module qobuz test
+        haberlea clear deezer
+        haberlea clear qobuz
     """
     ensure_haberlea(ctx)
 
-
-@settings_group.command("refresh")
-def settings_refresh() -> None:
-    """Refresh settings.toml configuration."""
-    try:
-        reload_settings()
-        click.echo("settings.toml has been refreshed successfully.")
-    except Exception as e:
-        click.echo(f"Failed to refresh settings: {e}", err=True)
-        raise SystemExit(1) from None
-
-
-@settings_group.command("modules")
-@click.pass_context
-async def settings_list_modules(ctx: click.Context) -> None:
-    """List all installed modules."""
-    haberlea: Haberlea = ctx.obj["haberlea"]
-
-    click.echo("Installed modules:")
-    for module_name in sorted(haberlea.module_list):
-        info = haberlea.module_settings[module_name]
-        test_status = "+" if info.test_url else "-"
-        click.echo(f"  {module_name}: {info.service_name} [test: {test_status}]")
-
-
-@settings_group.command("test-all")
-@click.pass_context
-async def settings_test_all(ctx: click.Context) -> None:
-    """Test all installed modules by downloading their test URLs."""
-    haberlea: Haberlea = ctx.obj["haberlea"]
-    output_path: Path = ctx.obj["output_path"]
-    tpm: dict[ModuleModes, str] = ctx.obj["third_party_modules"]
-    sdm: str = ctx.obj["separate_download"]
-
-    click.echo("Testing all installed modules...\n")
-
-    test_urls = []
-    module_names = []
-
-    for module_name in sorted(haberlea.module_list):
-        test_url = haberlea.module_settings[module_name].test_url
-        if test_url:
-            test_urls.append(test_url)
-            module_names.append(module_name)
-            click.echo(f"  {module_name}: {test_url}")
-        else:
-            click.echo(f"  {module_name}: no test URL configured (skipped)")
-
-    if not test_urls:
-        click.echo("\nNo modules with test URLs found.")
-        return
-
-    click.echo(f"\nRunning tests for {len(test_urls)} modules...\n")
-
-    try:
-        media_to_download = await resolve_urls_to_media(haberlea, tuple(test_urls))
-        completed, failed = await run_download_with_progress(
-            haberlea, media_to_download, tpm, sdm, str(output_path)
-        )
-
-        click.echo("\n=== Test Results ===")
-        click.echo(f"Completed: {len(completed)} tracks")
-        if failed:
-            click.echo(f"Failed: {len(failed)} tracks")
-            for track_id, error in failed:
-                click.echo(f"  - {track_id}: {error}")
-    except Exception as e:
-        click.echo(f"\nTest failed with error: {e}", err=True)
-        raise
-
-
-# =============================================================================
-# Module Subcommand Group
-# =============================================================================
-
-
-@settings_group.group("module")
-@click.argument("module_name")
-@click.pass_context
-async def module_group(ctx: click.Context, module_name: str) -> None:
-    """Module-specific settings and operations.
-
-    \b
-    Examples:
-        haberlea settings module qobuz test
-        haberlea settings module tidal info
-    """
-    haberlea: Haberlea = ctx.obj["haberlea"]
-    module_name = validate_module_name(haberlea, module_name)
-    ctx.obj["target_module"] = module_name
-
-
-@module_group.command("test")
-@click.pass_context
-async def module_test(ctx: click.Context) -> None:
-    """Test a specific module with its test URL."""
-    haberlea: Haberlea = ctx.obj["haberlea"]
-    module_name: str = ctx.obj["target_module"]
-    output_path: Path = ctx.obj["output_path"]
-    tpm: dict[ModuleModes, str] = ctx.obj["third_party_modules"]
-    sdm: str = ctx.obj["separate_download"]
-
-    test_url = haberlea.module_settings[module_name].test_url
-    if not test_url:
-        raise click.ClickException(f"Module {module_name} has no test URL configured.")
-
-    click.echo(f"Testing module {module_name} with URL: {test_url}")
-
-    media_to_download = await resolve_urls_to_media(haberlea, (test_url,))
-
-    completed, failed = await run_download_with_progress(
-        haberlea, media_to_download, tpm, sdm, str(output_path)
-    )
-
-    if completed:
-        click.echo(f"\nTest completed: {len(completed)} tracks")
-    if failed:
-        click.echo(f"Test failed: {len(failed)} tracks")
-
-
-@module_group.command("info")
-@click.pass_context
-async def module_info(ctx: click.Context) -> None:
-    """Show detailed information about a module."""
-    haberlea: Haberlea = ctx.obj["haberlea"]
-    module_name: str = ctx.obj["target_module"]
-
-    info = haberlea.module_settings[module_name]
-
-    click.echo(f"Module: {module_name}")
-    click.echo(f"  Service: {info.service_name}")
-    click.echo(f"  Modes: {info.module_supported_modes}")
-    click.echo(f"  Flags: {info.flags}")
-    click.echo(f"  Test URL: {info.test_url or 'Not configured'}")
-    click.echo(f"  URL Decoding: {info.url_decoding.value}")
-    click.echo(f"  Login Behavior: {info.login_behaviour.value}")
-
-
-# =============================================================================
-# Sessions Command Group
-# =============================================================================
-
-
-@cli.group("sessions")
-@click.pass_context
-async def sessions_group(ctx: click.Context) -> None:
-    """Manage module authentication sessions.
-
-    \b
-    Examples:
-        haberlea sessions list qobuz
-        haberlea sessions info tidal
-    """
-    ensure_haberlea(ctx)
-
-
-@sessions_group.command("list")
-@click.argument("module")
-@click.pass_context
-async def sessions_list(ctx: click.Context, module: str) -> None:
-    """List sessions for a module."""
-    haberlea: Haberlea = ctx.obj["haberlea"]
-    module = validate_module_name(haberlea, module)
-
-    click.echo(f"Sessions for module {module}:")
-    click.echo("  - default (active)")
-    click.echo()
-    click.echo("Note: Session listing is managed automatically in simple mode.")
-    click.echo("For advanced mode, edit loginstorage.json in your config directory.")
-
-
-@sessions_group.command("info")
-@click.argument("module")
-@click.pass_context
-async def sessions_info(ctx: click.Context, module: str) -> None:
-    """Show session information for a module."""
-    haberlea: Haberlea = ctx.obj["haberlea"]
-    module = validate_module_name(haberlea, module)
-
-    info = haberlea.module_settings[module]
-    click.echo(f"Session info for {module}:")
-    click.echo(f"  Login behavior: {info.login_behaviour.value}")
-    click.echo(f"  Session settings: {list(info.session_settings.keys())}")
-    click.echo(f"  Storage variables: {info.session_storage_variables}")
-
-
-@sessions_group.command("clear")
-@click.argument("module")
-@click.confirmation_option(prompt="Are you sure you want to clear this session?")
-@click.pass_context
-async def sessions_clear(ctx: click.Context, module: str) -> None:
-    """Clear session data for a module to force re-login."""
     haberlea: Haberlea = ctx.obj["haberlea"]
     module = validate_module_name(haberlea, module)
 
     if haberlea.clear_module_session(module):
         click.echo(f"Session for {module} has been cleared.")
-        click.echo("The module will re-authenticate on next use.")
     else:
         click.echo(f"Failed to clear session for {module}.", err=True)
 

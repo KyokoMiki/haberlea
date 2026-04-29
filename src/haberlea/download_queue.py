@@ -11,11 +11,14 @@ import time
 import uuid
 from collections.abc import Callable, Coroutine
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 import anyio
 import msgspec
 
+from .downloader.contexts import JobDefinition, ProgressUpdate
+from .downloader.results import DownloadSummary, FailedTrack
 from .plugins.base import ModuleBase
 from .utils.models import (
     CodecOptions,
@@ -39,15 +42,6 @@ class JobStatus(Enum):
     COMPLETED = "completed"
     PARTIAL = "partial"  # Some tracks failed
     FAILED = "failed"
-
-
-class MediaType(Enum):
-    """Type of media being downloaded."""
-
-    TRACK = "track"
-    ALBUM = "album"
-    PLAYLIST = "playlist"
-    ARTIST = "artist"
 
 
 class JobProgress(msgspec.Struct, frozen=True):
@@ -83,79 +77,146 @@ class JobProgress(msgspec.Struct, frozen=True):
         return self.finished >= self.total and self.total > 0
 
 
-class DownloadJob(msgspec.Struct, kw_only=True):
-    """Represents an original download request.
-
-    A job groups all tracks from a single URL/request together,
-    allowing progress tracking and completion detection at the
-    album/playlist/artist level.
+class QualityConfig(msgspec.Struct, frozen=True):
+    """Immutable quality configuration for the download queue.
 
     Attributes:
-        job_id: Unique identifier for this job.
-        original_url: The original URL that initiated this download.
-        media_type: Type of media (track, album, playlist, artist).
-        media_id: The media identifier from the service.
-        module_name: Name of the module handling this download.
-        name: Display name (album name, playlist name, etc.).
-        artist: Artist name for display.
-        download_path: Base path for downloaded files.
-        track_ids: List of track IDs belonging to this job.
-        track_infos: Dictionary mapping track IDs to their TrackInfo metadata.
-        completed_tracks: Set of successfully completed track IDs.
-        failed_tracks: Set of failed track IDs.
-        skipped_tracks: Set of skipped track IDs.
-        status: Current job status.
-        created_at: Unix timestamp when job was created.
-        cover_url: Cover image URL for the job.
+        quality_tier: Desired quality tier.
+        codec_options: Codec preference options.
     """
 
-    job_id: str
-    original_url: str
-    media_type: MediaType
-    media_id: str
-    module_name: str
-    name: str = ""
-    artist: str = ""
-    download_path: str = ""
-    track_ids: list[str] = msgspec.field(default_factory=list)
-    track_infos: dict[str, TrackInfo] = msgspec.field(default_factory=dict)
-    completed_tracks: set[str] = msgspec.field(default_factory=set)
-    failed_tracks: set[str] = msgspec.field(default_factory=set)
-    skipped_tracks: set[str] = msgspec.field(default_factory=set)
-    status: JobStatus = JobStatus.PENDING
-    created_at: float = 0.0
-    cover_url: str = ""
+    quality_tier: QualityEnum
+    codec_options: CodecOptions
+
+
+class TrackProgressMap:
+    """Tracks per-track outcomes for a single job.
+
+    Centralises the three outcome sets and track_infos so DownloadJob
+    itself stays at ≤3 fields.
+    """
+
+    def __init__(self) -> None:
+        self.track_ids: list[str] = []
+        self.track_infos: dict[str, TrackInfo] = {}
+        self._outcomes: dict[str, ProgressStatus] = {}
+
+    # ------------------------------------------------------------------
+    # Mutation helpers (called only by DownloadQueue under lock)
+    # ------------------------------------------------------------------
+
+    def add_track(self, track_id: str) -> None:
+        """Register a new track in this job."""
+        self.track_ids.append(track_id)
+
+    def record_outcome(self, track_id: str, status: ProgressStatus) -> None:
+        """Record the final outcome for a track."""
+        self._outcomes[track_id] = status
+
+    def store_info(self, track_id: str, info: TrackInfo) -> None:
+        """Store fetched TrackInfo for extension callbacks."""
+        self.track_infos[track_id] = info
+
+    # ------------------------------------------------------------------
+    # Read-only views
+    # ------------------------------------------------------------------
 
     @property
-    def has_successful_downloads(self) -> bool:
-        """Whether any tracks were successfully downloaded (not skipped)."""
-        return len(self.completed_tracks) > 0
+    def completed_tracks(self) -> set[str]:
+        """Set of successfully completed track IDs."""
+        return {
+            tid for tid, s in self._outcomes.items() if s == ProgressStatus.COMPLETED
+        }
+
+    @property
+    def failed_tracks(self) -> set[str]:
+        """Set of failed track IDs."""
+        return {tid for tid, s in self._outcomes.items() if s == ProgressStatus.FAILED}
+
+    @property
+    def skipped_tracks(self) -> set[str]:
+        """Set of skipped track IDs."""
+        return {tid for tid, s in self._outcomes.items() if s == ProgressStatus.SKIPPED}
+
+    @property
+    def is_finished(self) -> bool:
+        """Whether all registered tracks have a recorded outcome."""
+        return len(self._outcomes) >= len(self.track_ids) > 0
+
+    def get_progress(self) -> JobProgress:
+        """Return a frozen progress snapshot."""
+        completed = sum(
+            1 for s in self._outcomes.values() if s == ProgressStatus.COMPLETED
+        )
+        failed = sum(1 for s in self._outcomes.values() if s == ProgressStatus.FAILED)
+        skipped = sum(1 for s in self._outcomes.values() if s == ProgressStatus.SKIPPED)
+        return JobProgress(
+            completed=completed,
+            failed=failed,
+            skipped=skipped,
+            total=len(self.track_ids),
+        )
+
+    def get_results(self) -> DownloadSummary:
+        """Return a DownloadSummary for this job."""
+        completed = [
+            tid for tid, s in self._outcomes.items() if s == ProgressStatus.COMPLETED
+        ]
+        failed = [
+            FailedTrack(track_id=tid, reason="Download failed")
+            for tid, s in self._outcomes.items()
+            if s == ProgressStatus.FAILED
+        ]
+        return DownloadSummary(completed=completed, failed=failed)
+
+
+class DownloadJob:
+    """Mutable execution state for one download job.
+
+    Only DownloadQueue may mutate this object (guarded by _job_lock).
+    """
+
+    def __init__(self, definition: JobDefinition, job_id: str) -> None:
+        self.definition = definition
+        self.job_id = job_id
+        self.created_at: float = time.time()
+        self.status: JobStatus = JobStatus.PENDING
+        self.progress = TrackProgressMap()
+
+    # ------------------------------------------------------------------
+    # Computed properties
+    # ------------------------------------------------------------------
 
     @property
     def total_tracks(self) -> int:
         """Total number of tracks in this job."""
-        return len(self.track_ids)
+        return len(self.progress.track_ids)
 
     @property
     def finished_tracks(self) -> int:
-        """Number of tracks that have finished (success, failed, or skipped)."""
+        """Number of tracks that have finished."""
         return (
-            len(self.completed_tracks)
-            + len(self.failed_tracks)
-            + len(self.skipped_tracks)
+            len(self.progress.completed_tracks)
+            + len(self.progress.failed_tracks)
+            + len(self.progress.skipped_tracks)
         )
 
     @property
     def is_finished(self) -> bool:
         """Whether all tracks in this job have finished."""
-        return self.finished_tracks >= self.total_tracks and self.total_tracks > 0
+        return self.progress.is_finished
 
     @property
-    def progress(self) -> float:
+    def job_progress(self) -> float:
         """Job progress as a ratio (0.0 to 1.0)."""
         if self.total_tracks == 0:
             return 0.0
         return self.finished_tracks / self.total_tracks
+
+    @property
+    def has_successful_downloads(self) -> bool:
+        """Whether any tracks were successfully downloaded."""
+        return len(self.progress.completed_tracks) > 0
 
 
 class TrackTask(msgspec.Struct):
@@ -178,7 +239,7 @@ class TrackTask(msgspec.Struct):
     job_id: str
     module_name: str
     module: ModuleBase
-    download_path: str = ""
+    download_path: Path = msgspec.field(default_factory=Path)
     track_index: int = 0
     total_tracks: int = 0
     main_artist: str = ""
@@ -190,12 +251,22 @@ class TrackTask(msgspec.Struct):
 JobCompletionCallback = Callable[[DownloadJob], Coroutine[Any, Any, None]]
 
 
+class QueueState:
+    """Mutable runtime state of the download queue.
+
+    Extracted so DownloadQueue itself has ≤4 fields.
+    """
+
+    def __init__(self) -> None:
+        self.jobs: dict[str, DownloadJob] = {}
+        self.track_tasks: dict[str, TrackTask] = {}
+        self.job_lock = anyio.Lock()
+
+
 class DownloadQueue:
     """Global download queue with job-based organization.
 
-    This queue organizes downloads by job (original URL/request) while
-    executing track downloads concurrently. Progress is reported through
-    the unified progress system in utils.progress.
+    Four fields: semaphore (dep) + _on_job_complete (dep) + _config + _state.
     """
 
     def __init__(
@@ -204,6 +275,7 @@ class DownloadQueue:
         quality_tier: QualityEnum,
         codec_options: CodecOptions,
         on_job_complete: JobCompletionCallback | None = None,
+        module_limits: dict[str, int] | None = None,
     ) -> None:
         """Initializes the download queue.
 
@@ -212,71 +284,60 @@ class DownloadQueue:
             quality_tier: Quality tier for downloads.
             codec_options: Codec options for downloads.
             on_job_complete: Optional callback when a job completes.
+            module_limits: Optional per-module concurrency caps. Maps module
+                name to the maximum number of tracks that may be downloading
+                simultaneously for that module. Modules absent from this dict
+                are only bounded by ``max_concurrent``.
         """
-        self.semaphore = anyio.Semaphore(max_concurrent)
-        self._quality_tier = quality_tier
-        self._codec_options = codec_options
+        self.limiter = anyio.CapacityLimiter(max_concurrent)
         self._on_job_complete = on_job_complete
+        self._config = QualityConfig(
+            quality_tier=quality_tier, codec_options=codec_options
+        )
+        self._state = QueueState()
+        self._module_limits: dict[str, int] = dict(module_limits or {})
+        self._module_limiters: dict[str, anyio.CapacityLimiter] = {}
 
-        # Job management
-        self._jobs: dict[str, DownloadJob] = {}
-        self._track_tasks: dict[str, TrackTask] = {}
-        self._job_lock = anyio.Lock()
+    def get_module_limiter(self, module_name: str) -> anyio.CapacityLimiter | None:
+        """Returns the per-module concurrency limiter, if any.
 
-    def _generate_job_id(self, original_url: str) -> str:
-        """Generates a unique job ID from the original URL.
+        Lazily instantiates a ``CapacityLimiter`` on first access so that
+        tasks for the same module share a single limiter.
 
         Args:
-            original_url: The original download URL.
+            module_name: The module name.
 
         Returns:
-            A unique job identifier.
+            A ``CapacityLimiter`` bounding concurrent downloads for this
+            module, or ``None`` if the module has no declared cap.
         """
-        # Use UUID4 for guaranteed uniqueness
+        limit = self._module_limits.get(module_name)
+        if limit is None or limit <= 0:
+            return None
+        limiter = self._module_limiters.get(module_name)
+        if limiter is None:
+            limiter = anyio.CapacityLimiter(limit)
+            self._module_limiters[module_name] = limiter
+        return limiter
+
+    def _generate_job_id(self, original_url: str) -> str:
+        """Generates a unique job ID."""
         return str(uuid.uuid4())
 
-    async def create_job(
-        self,
-        original_url: str,
-        media_type: MediaType,
-        media_id: str,
-        module_name: str,
-        name: str = "",
-        artist: str = "",
-        download_path: str = "",
-        cover_url: str = "",
-    ) -> str:
-        """Creates a new download job.
+    async def create_job(self, definition: JobDefinition) -> str:
+        """Creates a new download job from an immutable definition.
 
         Args:
-            original_url: The original URL that initiated this download.
-            media_type: Type of media (track, album, playlist, artist).
-            media_id: The media identifier from the service.
-            module_name: Name of the module handling this download.
-            name: Display name (album name, playlist name, etc.).
-            artist: Artist name for display.
-            download_path: Base path for downloaded files.
-            cover_url: Cover image URL.
+            definition: Immutable job definition containing all metadata.
 
         Returns:
             The generated job ID.
         """
-        job_id = self._generate_job_id(original_url)
-        job = DownloadJob(
-            job_id=job_id,
-            original_url=original_url,
-            media_type=media_type,
-            media_id=media_id,
-            module_name=module_name,
-            name=name,
-            artist=artist,
-            download_path=download_path,
-            cover_url=cover_url,
-            created_at=time.time(),
-        )
-        async with self._job_lock:
-            self._jobs[job_id] = job
-        logger.debug("Created job %s for %s", job_id, original_url)
+        job_id = self._generate_job_id(definition.original_url)
+        job = DownloadJob(definition=definition, job_id=job_id)
+        async with self._state.job_lock:
+            self._state.jobs[job_id] = job
+        logger.debug("Created job %s for %s", job_id, definition.original_url)
         return job_id
 
     async def add_track(self, job_id: str, task: TrackTask) -> None:
@@ -289,18 +350,15 @@ class DownloadQueue:
         Raises:
             KeyError: If the job ID doesn't exist.
         """
-        async with self._job_lock:
-            if job_id not in self._jobs:
+        async with self._state.job_lock:
+            if job_id not in self._state.jobs:
                 raise KeyError(f"Job {job_id} not found")
 
-            job = self._jobs[job_id]
-            job.track_ids.append(task.track_id)
-            self._track_tasks[task.track_id] = task
-            # Capture job name for use outside the lock
-            job_name = job.name
+            job = self._state.jobs[job_id]
+            job.progress.add_track(task.track_id)
+            self._state.track_tasks[task.track_id] = task
+            job_name = job.definition.name
 
-        # Create progress task for UI (use job name for album/playlist)
-        # This is done outside the lock to avoid holding lock during async call
         await create_task(
             task_id=task.track_id,
             service=task.module_name,
@@ -315,46 +373,31 @@ class DownloadQueue:
             job_id: The job ID.
 
         Returns:
-            The job or None if not found.
+            A DownloadJob or None if not found.
         """
-        return self._jobs.get(job_id)
+        return self._state.jobs.get(job_id)
 
     def get_track_task(self, track_id: str) -> TrackTask | None:
-        """Gets a track task by ID.
-
-        Args:
-            track_id: The track ID.
-
-        Returns:
-            The track task or None if not found.
-        """
-        return self._track_tasks.get(track_id)
+        """Gets a track task by ID."""
+        return self._state.track_tasks.get(track_id)
 
     def get_all_jobs(self) -> list[DownloadJob]:
-        """Gets all jobs in the queue.
-
-        Returns:
-            List of all jobs.
-        """
-        return list(self._jobs.values())
+        """Gets all jobs in the queue."""
+        return list(self._state.jobs.values())
 
     def get_all_track_tasks(self) -> list[TrackTask]:
-        """Gets all track tasks in the queue.
-
-        Returns:
-            List of all track tasks.
-        """
-        return list(self._track_tasks.values())
+        """Gets all track tasks in the queue."""
+        return list(self._state.track_tasks.values())
 
     @property
     def job_count(self) -> int:
         """Returns number of jobs in the queue."""
-        return len(self._jobs)
+        return len(self._state.jobs)
 
     @property
     def track_count(self) -> int:
         """Returns number of track tasks in the queue."""
-        return len(self._track_tasks)
+        return len(self._state.track_tasks)
 
     async def mark_track_complete(
         self,
@@ -367,94 +410,69 @@ class DownloadQueue:
             track_id: The track identifier.
             status: The completion status (COMPLETED, FAILED, or SKIPPED).
         """
-        task = self._track_tasks.get(track_id)
+        task = self._state.track_tasks.get(track_id)
         if not task:
             logger.warning("Track %s not found in queue", track_id)
             return
 
-        job = self._jobs.get(task.job_id)
+        job = self._state.jobs.get(task.job_id)
         if not job:
             logger.warning("Job %s not found for track %s", task.job_id, track_id)
             return
 
-        async with self._job_lock:
-            # Update job tracking sets
-            if status == ProgressStatus.COMPLETED:
-                job.completed_tracks.add(track_id)
-            elif status == ProgressStatus.FAILED:
-                job.failed_tracks.add(track_id)
-            elif status == ProgressStatus.SKIPPED:
-                job.skipped_tracks.add(track_id)
+        async with self._state.job_lock:
+            job.progress.record_outcome(track_id, status)
 
-            # Check if job is finished
-            if job.is_finished:
-                if job.failed_tracks:
+            if job.progress.is_finished:
+                if job.progress.failed_tracks:
                     job.status = JobStatus.PARTIAL
                 else:
                     job.status = JobStatus.COMPLETED
 
+                p = job.progress.get_progress()
                 logger.info(
                     "Job %s finished: %d completed, %d failed, %d skipped",
                     job.job_id,
-                    len(job.completed_tracks),
-                    len(job.failed_tracks),
-                    len(job.skipped_tracks),
+                    p.completed,
+                    p.failed,
+                    p.skipped,
                 )
 
                 if self._on_job_complete:
                     await self._on_job_complete(job)
 
-    async def update_progress(
-        self,
-        track_id: str,
-        status: ProgressStatus | None = None,
-        name: str | None = None,
-        artist: str | None = None,
-        album: str | None = None,
-        progress: float | None = None,
-        message: str | None = None,
-        file_size: int | None = None,
-        downloaded_size: int | None = None,
-    ) -> None:
+    async def update_progress(self, progress_update: ProgressUpdate) -> None:
         """Updates progress for a track.
 
         Args:
-            track_id: The track identifier.
-            status: New status.
-            name: Track name.
-            artist: Artist name.
-            album: Album name.
-            progress: Download progress (0.0 to 1.0).
-            message: Status message.
-            file_size: Total file size in bytes.
-            downloaded_size: Downloaded size in bytes.
+            progress_update: Progress update payload with all fields.
         """
         current: int | None = None
         total: int | None = None
 
-        if file_size is not None:
-            total = file_size
-        if downloaded_size is not None:
-            current = downloaded_size
-        elif progress is not None and file_size:
-            current = int(progress * file_size)
+        if progress_update.file_size is not None:
+            total = progress_update.file_size
+        if progress_update.downloaded_size is not None:
+            current = progress_update.downloaded_size
+        elif progress_update.progress is not None and progress_update.file_size:
+            current = int(progress_update.progress * progress_update.file_size)
 
         await update(
-            task_id=track_id,
-            status=status,
-            name=name,
-            artist=artist,
-            album=album,
+            task_id=progress_update.track_id,
+            status=progress_update.status,
+            name=progress_update.name,
+            artist=progress_update.artist,
+            album=progress_update.album,
             current=current,
             total=total,
-            message=message,
+            message=progress_update.message,
         )
 
-        # Update job status to downloading if first track starts
-        async with self._job_lock:
-            task = self._track_tasks.get(track_id)
-            if task and status == ProgressStatus.DOWNLOADING:
-                job = self._jobs.get(task.job_id)
+        # Update job status to DOWNLOADING when first track starts
+        async with self._state.job_lock:
+            task = self._state.track_tasks.get(progress_update.track_id)
+            if task and progress_update.status == ProgressStatus.DOWNLOADING:
+                job = self._state.jobs.get(task.job_id)
                 if job and job.status == JobStatus.PENDING:
                     job.status = JobStatus.DOWNLOADING
 
@@ -467,37 +485,28 @@ class DownloadQueue:
         Returns:
             JobProgress with completed, failed, skipped, and total counts.
         """
-        job = self._jobs.get(job_id)
+        job = self._state.jobs.get(job_id)
         if not job:
             return JobProgress(completed=0, failed=0, skipped=0, total=0)
-        return JobProgress(
-            completed=len(job.completed_tracks),
-            failed=len(job.failed_tracks),
-            skipped=len(job.skipped_tracks),
-            total=job.total_tracks,
-        )
+        return job.progress.get_progress()
 
-    def get_results(self) -> tuple[list[str], list[tuple[str, str]]]:
+    def get_results(self) -> DownloadSummary:
         """Returns download results for all tracks.
 
         Returns:
-            Tuple of (completed track IDs, failed track IDs with errors).
+            DownloadSummary with completed track IDs and failed track details.
         """
-        completed: list[str] = []
-        failed: list[tuple[str, str]] = []
-
-        for job in self._jobs.values():
-            completed.extend(job.completed_tracks)
-            for track_id in job.failed_tracks:
-                failed.append((track_id, "Download failed"))
-
-        return completed, failed
+        summaries = [j.progress.get_results() for j in self._state.jobs.values()]
+        return DownloadSummary(
+            completed=[tid for s in summaries for tid in s.completed],
+            failed=[f for s in summaries for f in s.failed],
+        )
 
     async def clear(self) -> None:
         """Clears all jobs and tasks from the queue."""
-        async with self._job_lock:
-            self._jobs.clear()
-            self._track_tasks.clear()
+        async with self._state.job_lock:
+            self._state.jobs.clear()
+            self._state.track_tasks.clear()
 
     async def remove_job(self, job_id: str) -> bool:
         """Removes a job and its tracks from the queue.
@@ -508,12 +517,12 @@ class DownloadQueue:
         Returns:
             True if the job was removed, False if not found.
         """
-        async with self._job_lock:
-            job = self._jobs.pop(job_id, None)
+        async with self._state.job_lock:
+            job = self._state.jobs.pop(job_id, None)
             if not job:
                 return False
 
-            for track_id in job.track_ids:
-                self._track_tasks.pop(track_id, None)
+            for track_id in job.progress.track_ids:
+                self._state.track_tasks.pop(track_id, None)
 
             return True

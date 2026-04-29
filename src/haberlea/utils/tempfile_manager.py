@@ -18,8 +18,6 @@ from tempfile import gettempdir
 
 from anyio import NamedTemporaryFile, TemporaryDirectory
 
-from .settings import settings
-
 
 class TempFileManager:
     """Centralized temporary file manager using anyio's automatic cleanup.
@@ -67,9 +65,7 @@ class TempFileManager:
         if base_dir:
             self._base_dir = Path(base_dir)
         else:
-            # Use temp_path from settings if configured, otherwise system temp
-            temp_path = settings.global_settings.general.temp_path
-            self._base_dir = Path(temp_path) if temp_path else Path(gettempdir())
+            self._base_dir = Path(gettempdir())
 
         # Ensure base directory exists
         self._base_dir.mkdir(parents=True, exist_ok=True)

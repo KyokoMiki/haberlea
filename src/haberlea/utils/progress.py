@@ -179,49 +179,16 @@ async def create_task(
     await _dispatch(event)
 
 
-def _build_event_updates(
-    status: ProgressStatus | None,
-    name: str | None,
-    artist: str | None,
-    album: str | None,
-    current: int | None,
-    total: int | None,
-    message: str | None,
-    mode: ProgressMode | None,
-) -> dict[str, Any]:
-    """Build event updates dictionary.
+def _collect_non_none(**kwargs: Any) -> dict[str, Any]:
+    """Collect keyword arguments that are not None.
 
     Args:
-        status: New status.
-        name: Display name.
-        artist: Artist name.
-        album: Album name.
-        current: Current progress value.
-        total: Total value.
-        message: Status message.
-        mode: Progress display mode.
+        **kwargs: Keyword arguments to filter.
 
     Returns:
-        Dictionary of updates.
+        Dictionary of non-None arguments.
     """
-    updates: dict[str, Any] = {}
-    if status is not None:
-        updates["status"] = status
-    if name is not None:
-        updates["name"] = name
-    if artist is not None:
-        updates["artist"] = artist
-    if album is not None:
-        updates["album"] = album
-    if current is not None:
-        updates["current"] = current
-    if total is not None:
-        updates["total"] = total
-    if message is not None:
-        updates["message"] = message
-    if mode is not None:
-        updates["mode"] = mode
-    return updates
+    return {k: v for k, v in kwargs.items() if v is not None}
 
 
 def _should_dispatch_event(
@@ -292,9 +259,16 @@ async def update(
         _tasks[task_id] = event
         _last_reported[task_id] = 0
 
-    # Build updates
-    updates = _build_event_updates(
-        status, name, artist, album, current, total, message, mode
+    # Build updates and apply via struct replace
+    updates = _collect_non_none(
+        status=status,
+        name=name,
+        artist=artist,
+        album=album,
+        current=current,
+        total=total,
+        message=message,
+        mode=mode,
     )
 
     if updates:

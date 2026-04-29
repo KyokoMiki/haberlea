@@ -44,12 +44,12 @@ def create_login_page():
         webui_settings = settings.global_settings.webui
 
         def try_login() -> None:
-            if compare_digest(
-                username_input.value, webui_settings.username
-            ) and compare_digest(password_input.value, webui_settings.password):
-                app.storage.user.update(
-                    {"username": username_input.value, "authenticated": True}
-                )
+            username = username_input.value or ""
+            password = password_input.value or ""
+            if compare_digest(username, webui_settings.username) and compare_digest(
+                password, webui_settings.password
+            ):
+                app.storage.user.update({"username": username, "authenticated": True})
                 # Validate redirect_to to prevent open redirect
                 safe_redirect = redirect_to
                 if not redirect_to.startswith("/") or redirect_to.startswith("//"):
