@@ -371,7 +371,10 @@ def init_haberlea_context(
 # =============================================================================
 
 
-@click.group(invoke_without_command=True)
+@click.group(
+    invoke_without_command=True,
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
 @click.option(
     "-o",
     "--output",

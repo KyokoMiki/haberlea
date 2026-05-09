@@ -28,7 +28,6 @@ class ExtensionManager:
             discovered: Pre-discovered extension information (from bootstrap).
             extension_list: Pre-built set of extension names (from bootstrap).
         """
-        self.extensions: list[ExtensionInstance] = []
         self.extension_list: set[str] = extension_list or set()
         self.discovered_extensions: dict[str, Any] = discovered or {}
 
@@ -39,10 +38,17 @@ class ExtensionManager:
             self.extension_list.add(ext_name)
             logger.debug("Extension detected: %s", ext_name)
 
-    def initialize(self) -> None:
-        """Initializes extension instances sorted by priority.
+    def build_instances(self) -> list[ExtensionInstance]:
+        """Builds a fresh batch of extension instances from current settings.
 
-        Priority is read from user settings, defaulting to 100.
+        Each call reads the latest values from ``settings.extensions`` and
+        instantiates new objects, sorted by priority. This is intended to
+        be invoked once per download batch so configuration changes made
+        via the WebUI take effect on the next download without restarting
+        the application or interfering with batches already in flight.
+
+        Returns:
+            A new list of ``ExtensionInstance`` sorted by priority (asc).
         """
         extension_instances: list[ExtensionInstance] = []
 
@@ -62,7 +68,7 @@ class ExtensionManager:
                     )
                 )
 
-        self.extensions = sorted(extension_instances, key=lambda x: x.priority)
+        return sorted(extension_instances, key=lambda x: x.priority)
 
     def _get_extension_settings(self, ext_name: str, ext_info: Any) -> dict[str, Any]:
         """Gets extension settings from config or defaults.
@@ -78,15 +84,18 @@ class ExtensionManager:
         type_config = settings.extensions.get(ext_type, {})
         return type_config.get(ext_name) or ext_info.settings
 
-    async def run_for_job(self, job: Any) -> None:
-        """Runs all extensions for a completed job.
+    @staticmethod
+    async def run_for_job(extensions: list[ExtensionInstance], job: Any) -> None:
+        """Runs the given extension instances for a completed job.
 
         Extensions are executed in priority order.
 
         Args:
+            extensions: Extension instances to invoke (typically the per-batch
+                list returned by :meth:`build_instances`).
             job: The completed download job.
         """
-        for ext in self.extensions:
+        for ext in extensions:
             try:
                 logger.info(
                     "=== Running Extension %s (priority: %d) ===",
@@ -102,12 +111,15 @@ class ExtensionManager:
                     getattr(job, "download_path", "unknown"),
                 )
 
-    async def run_finalize(self) -> None:
-        """Runs on_all_complete method for all extensions.
+    @staticmethod
+    async def run_finalize(extensions: list[ExtensionInstance]) -> None:
+        """Runs ``on_all_complete`` on the given extension instances.
 
-        Extensions are executed in priority order.
+        Args:
+            extensions: Extension instances to finalize (typically the same
+                per-batch list passed to :meth:`run_for_job`).
         """
-        for ext in self.extensions:
+        for ext in extensions:
             try:
                 await ext.instance.on_all_complete()
             except Exception:

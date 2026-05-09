@@ -332,6 +332,7 @@ class DownloadPage:
             "album": "album",
             "playlist": "queue_music",
             "artist": "person",
+            "video": "movie",
         }
         status_colors = {
             "pending": "bg-gray-100",

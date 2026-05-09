@@ -281,6 +281,7 @@ class ModuleRegistry:
                 resolution=covers.main_resolution,
                 compression=CoverCompressionEnum[covers.main_compression],
             ),
+            concurrent_downloads=gs.runtime.concurrent_downloads,
         )
 
     def _ensure_module_data_folder(self, module: str) -> None:

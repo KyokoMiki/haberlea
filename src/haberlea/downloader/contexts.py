@@ -26,6 +26,8 @@ if TYPE_CHECKING:
         ModuleInformation,
         ModuleModes,
         TrackInfo,
+        VideoContainerEnum,
+        VideoInfo,
     )
     from haberlea.utils.progress import ProgressStatus
     from haberlea.utils.settings import CoversSettings
@@ -44,20 +46,30 @@ class ModuleRef(msgspec.Struct, frozen=True):
 class TrackContext(msgspec.Struct):
     """TrackTask enriched with runtime data.
 
-    Created once after get_track_info(), passed through entire pipeline.
+    Created once after metadata fetch, passed through the entire pipeline.
+    For audio tasks ``track_info`` is populated; for video tasks
+    ``video_info`` + ``video_container`` are populated. Exactly one of
+    the info fields is non-None.
     """
 
     task: TrackTask
-    track_info: TrackInfo
-    # Path without extension, derived from track_info + download_path
-    location_name: Path
+    location_name: Path  # Path without extension
+    track_info: TrackInfo | None = None
+    video_info: VideoInfo | None = None
+    video_container: VideoContainerEnum | None = None
 
     @property
     def location(self) -> Path:
-        """Full path with extension."""
-        return self.location_name.parent / (
-            self.location_name.name + f".{self.track_info.codec.container.name}"
-        )
+        """Full path with the appropriate extension."""
+        if self.video_info is not None and self.video_container is not None:
+            ext = self.video_container.value
+        elif self.track_info is not None:
+            ext = self.track_info.codec.container.name
+        else:
+            raise RuntimeError(
+                "TrackContext has neither track_info nor video_info populated"
+            )
+        return self.location_name.parent / (self.location_name.name + f".{ext}")
 
 
 class AlbumQueueRequest(msgspec.Struct, frozen=True):
@@ -96,6 +108,20 @@ class ArtistQueueRequest(msgspec.Struct, frozen=True):
     module: ModuleRef
     artist_id: str
     original_url: str = ""
+
+
+class VideoQueueRequest(msgspec.Struct, frozen=True):
+    """Single music video queue request.
+
+    The queue builder converts this into a regular ``TrackTask`` with
+    ``media_kind=MediaKindEnum.video`` so the rest of the pipeline can
+    stay media-kind agnostic.
+    """
+
+    module: ModuleRef
+    video_id: str
+    original_url: str = ""
+    video_data: dict[str, Any] | None = None
 
 
 class DownloadRequest(msgspec.Struct, frozen=True):

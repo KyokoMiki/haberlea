@@ -163,6 +163,21 @@ class SettingsPage:
                 value=gs.quality.proprietary_codecs,
             ).bind_value(gs.quality, "proprietary_codecs")
 
+            ui.separator().classes("my-2")
+            ui.label(_("Music Video")).classes("text-sm text-gray-600")
+
+            ui.select(
+                label=_("Video Quality"),
+                options=["minimum", "low", "medium", "high", "max"],
+                value=gs.quality.video_tier,
+            ).classes("w-48 mb-2").bind_value(gs.quality, "video_tier")
+
+            ui.select(
+                label=_("Video Container"),
+                options=["mp4", "mkv"],
+                value=gs.quality.video_container,
+            ).classes("w-48").bind_value(gs.quality, "video_container")
+
     def _render_artist_downloading_settings(self) -> None:
         """Renders artist downloading behavior section."""
         gs = self._edit_settings.global_settings
@@ -258,9 +273,14 @@ class SettingsPage:
             ui.input(
                 label=_("Single Full Path Format"),
                 value=gs.formatting.single_full_path_format,
-            ).classes("w-full mb-4").bind_value(
+            ).classes("w-full mb-2").bind_value(
                 gs.formatting, "single_full_path_format"
             )
+
+            ui.input(
+                label=_("Music Video Format"),
+                value=gs.formatting.video_format,
+            ).classes("w-full mb-4").bind_value(gs.formatting, "video_format")
 
             ui.checkbox(
                 _("Enable Zero Padding"),

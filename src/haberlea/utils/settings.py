@@ -55,11 +55,15 @@ class QualitySettings(msgspec.Struct, kw_only=True):
         tier: Audio quality tier (minimum/low/medium/high/lossless/hifi).
         spatial_codecs: Allow spatial audio codecs (Atmos, 360RA, etc.).
         proprietary_codecs: Allow proprietary codecs (MQA, Dolby, etc.).
+        video_tier: Video quality tier (minimum/low/medium/high/max).
+        video_container: Video container format (mp4/mkv).
     """
 
     tier: str = "hifi"
     spatial_codecs: bool = True
     proprietary_codecs: bool = False
+    video_tier: str = "max"
+    video_container: str = "mkv"
 
 
 class ArtistDownloadingSettings(msgspec.Struct, kw_only=True):
@@ -84,6 +88,8 @@ class FormattingSettings(msgspec.Struct, kw_only=True):
         playlist_format: Format string for playlist folder names.
         track_filename_format: Format string for track file names.
         single_full_path_format: Format string for single track downloads.
+        video_format: Format string for music video file paths
+            (relative to the base download path, no extension).
         enable_zfill: Zero-pad track numbers.
         force_album_format: Always use album format even for singles.
     """
@@ -92,6 +98,7 @@ class FormattingSettings(msgspec.Struct, kw_only=True):
     playlist_format: str = "{name}{explicit}"
     track_filename_format: str = "{track_number}. {name}"
     single_full_path_format: str = "{name}"
+    video_format: str = "Videos/{artist} - {name}{explicit}"
     enable_zfill: bool = True
     force_album_format: bool = False
 

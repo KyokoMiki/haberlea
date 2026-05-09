@@ -66,7 +66,7 @@ class DownloadTask(msgspec.Struct, kw_only=True, frozen=True):
         status: Task status (pending, downloading, completed, failed).
         progress: Download progress from 0.0 to 1.0.
         message: Status message or error description.
-        media_type: Type of media (track, album, playlist, artist).
+        media_type: Type of media (track, album, playlist, artist, video).
         media_id: Media identifier.
         service: Service name (qobuz, tidal, etc.).
         data: Pre-fetched data for the download task.

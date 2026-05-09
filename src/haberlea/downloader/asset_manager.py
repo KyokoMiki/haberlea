@@ -152,6 +152,8 @@ class AssetManager:
             Path to the downloaded cover file, or None if download failed.
         """
         track_info = ctx.track_info
+        if track_info is None:
+            raise RuntimeError("download_cover requires an audio track context")
         module_name = ctx.task.module_name
         third_party = self._third_party_modules.get(ModuleModes.covers)
 
@@ -191,6 +193,8 @@ class AssetManager:
             return LyricsResult(embedded="", synced=None)
 
         track_info = ctx.track_info
+        if track_info is None:
+            raise RuntimeError("get_lyrics requires an audio track context")
         module_name = ctx.task.module_name
         module = ctx.task.module
         lyrics_info = LyricsInfo()
@@ -226,6 +230,8 @@ class AssetManager:
             List of CreditsInfo objects.
         """
         track_info = ctx.track_info
+        if track_info is None:
+            raise RuntimeError("get_credits requires an audio track context")
         module_name = ctx.task.module_name
         module = ctx.task.module
         third_party = self._third_party_modules.get(ModuleModes.credits)

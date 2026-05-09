@@ -44,7 +44,7 @@ class SearchPage:
                 # Type selector
                 ui.select(
                     label=_("Type"),
-                    options=["track", "album", "artist", "playlist"],
+                    options=["track", "album", "artist", "playlist", "video"],
                     value=self.selected_type,
                     on_change=lambda e: setattr(self, "selected_type", e.value),
                 ).classes("w-32")
@@ -135,8 +135,11 @@ class SearchPage:
                 ui.card().classes("w-full p-3 hover:bg-gray-50 cursor-pointer"),
                 ui.row().classes("w-full items-center gap-4"),
             ):
-                # Cover placeholder
-                ui.icon("album", size="xl").classes("text-gray-400")
+                # Cover placeholder (icon depends on result type)
+                ui.icon(
+                    "movie" if self.selected_type == "video" else "album",
+                    size="xl",
+                ).classes("text-gray-400")
 
                 # Info
                 with ui.column().classes("flex-grow min-w-0"):

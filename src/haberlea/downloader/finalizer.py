@@ -95,6 +95,9 @@ class TrackFinalizer:
         track_location = file_result.path
         if track_location is None:
             raise ValueError("Cannot finalize track with no file path")
+        track_info = ctx.track_info
+        if track_info is None:
+            raise RuntimeError("finalize requires an audio track context")
 
         container = file_result.container
 
@@ -113,10 +116,10 @@ class TrackFinalizer:
 
         # Add to M3U playlist (use final location, not temp path)
         if playlist is not None:
-            await self._add_to_m3u(playlist, ctx.track_info, final_location)
+            await self._add_to_m3u(playlist, track_info, final_location)
 
         # Tag file
-        self._tag_with_info(track_location, ctx.track_info, metadata, container)
+        self._tag_with_info(track_location, track_info, metadata, container)
 
         # Move to final location
         await move_file(track_location, final_location)

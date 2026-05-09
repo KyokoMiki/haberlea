@@ -22,6 +22,7 @@ from haberlea.downloader.contexts import (
     PlaylistQueueRequest,
     ProgressUpdate,
     TrackQueueRequest,
+    VideoQueueRequest,
 )
 from haberlea.downloader.finalizer import PlaylistContext, TrackFinalizer, TrackMetadata
 from haberlea.downloader.queue_builder import QueueBuilder
@@ -29,7 +30,7 @@ from haberlea.downloader.results import DownloadSummary, TrackDownloadOutput
 from haberlea.downloader.track_downloader import TrackDownloader
 from haberlea.i18n import _
 from haberlea.plugins.base import TrackCompleteEvent
-from haberlea.utils.models import DownloadTypeEnum, ModuleModes
+from haberlea.utils.models import DownloadTypeEnum, MediaKindEnum, ModuleModes
 from haberlea.utils.path_builder import PathBuilder
 from haberlea.utils.progress import ProgressStatus
 from haberlea.utils.settings import settings
@@ -154,6 +155,10 @@ class Downloader:
         """Queues an artist's albums and tracks for download."""
         return await self._queue_builder.queue_artist(request)
 
+    async def queue_video(self, request: VideoQueueRequest) -> str:
+        """Queues a single music video for download."""
+        return await self._queue_builder.queue_video(request)
+
     # ------------------------------------------------------------------
     # Queue processing
     # ------------------------------------------------------------------
@@ -238,7 +243,13 @@ class Downloader:
     async def _run_post_download(
         self, task: TrackTask, output: TrackDownloadOutput
     ) -> None:
-        """Fetch assets and finalize after successful audio download."""
+        """Fetch assets and finalize after successful audio download.
+
+        Music videos skip this entire pipeline: tagging, lyrics, cover
+        embedding, and credits do not apply to MV containers.
+        """
+        if task.media_kind is MediaKindEnum.video:
+            return
         ctx = output.ctx
         file_result = output.file_result
         if ctx is None or file_result is None:

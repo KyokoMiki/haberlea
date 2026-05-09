@@ -350,6 +350,19 @@ class DownloadTypeEnum(Enum):
     playlist = "playlist"
     artist = "artist"
     album = "album"
+    video = "video"
+
+
+class MediaKindEnum(Enum):
+    """Execution-level media kind for a download task.
+
+    Distinguishes how a single ``TrackTask`` should be processed:
+    audio downloads go through tagging/cover/lyrics/finalize; videos
+    fetch HLS segments and remux directly to the configured container.
+    """
+
+    audio = "audio"
+    video = "video"
 
 
 class MediaIdentification(msgspec.Struct, kw_only=True):
@@ -375,6 +388,32 @@ class QualityEnum(Enum):
     HIGH = "high"
     LOSSLESS = "lossless"
     HIFI = "hifi"
+
+
+class VideoQualityEnum(Enum):
+    """Video quality tier (5 tiers parallel to QualityEnum).
+
+    Modules map these to concrete vertical resolutions and pick the
+    closest available HLS variant.
+    """
+
+    MINIMUM = "minimum"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    MAX = "max"
+
+
+class VideoContainerEnum(Enum):
+    """Video container format for music video downloads.
+
+    Attributes:
+        mp4: MP4 container (best compatibility).
+        mkv: Matroska container (codec-agnostic, lossless remux of any track).
+    """
+
+    mp4 = "mp4"
+    mkv = "mkv"
 
 
 class CodecOptions(msgspec.Struct):
@@ -409,6 +448,9 @@ class HabeleaOptions(msgspec.Struct):
     debug_mode: bool
     quality_tier: QualityEnum  # Here because of subscription checking
     default_cover_options: CoverOptions
+    concurrent_downloads: int
+    video_quality_tier: VideoQualityEnum = VideoQualityEnum.HIGH
+    video_container: VideoContainerEnum = VideoContainerEnum.mkv
 
 
 class ModuleController(msgspec.Struct):
@@ -518,38 +560,95 @@ class PlaylistInfo(msgspec.Struct, kw_only=True):
     track_data: dict[str, Any] | None = None
 
 
-class TrackInfo(msgspec.Struct, kw_only=True):
-    """Track metadata information."""
+class MediaInfo(msgspec.Struct, kw_only=True):
+    """Common metadata for any downloadable media item.
+
+    Base struct shared by ``TrackInfo`` (audio) and ``VideoInfo`` (music
+    videos). Holds the 8 fields that are semantically identical across
+    both kinds; subclasses add kind-specific fields without redeclaring
+    the common ones. Inheritance preserves ``isinstance`` and ``match``
+    narrowing for downstream code.
+
+    Attributes:
+        name: Display title of the media item.
+        artists: List of artist display names (first is the main artist).
+        release_year: Release year (0 if unknown).
+        cover_url: Cover image URL (mandatory; modules must always
+            resolve at least a generic cover).
+        artist_id: Main artist identifier.
+        duration: Duration in whole seconds.
+        explicit: Explicit flag (``None`` when unknown).
+        download_data: Module-specific payload reused by the matching
+            ``get_*_download`` call.
+        error: Error message if metadata fetch failed.
+    """
 
     name: str
+    artists: list[str]
+    release_year: int
+    cover_url: str
+    artist_id: str | None = None
+    duration: int | None = None
+    explicit: bool | None = None
+    download_data: dict[str, Any] | None = None
+    error: str | None = None
+
+
+class TrackInfo(MediaInfo, kw_only=True):
+    """Audio track metadata information."""
+
     album: str
     album_id: str
-    artists: list[str]
     tags: Tags
     codec: CodecEnum
-    cover_url: str
-    release_year: int
-    duration: int | None = None  # Duration in whole seconds
-    explicit: bool | None = None
-    artist_id: str | None = None
     animated_cover_url: str | None = None
     description: str | None = None
     bit_depth: int = 16
     sample_rate: float = 44.1
     bitrate: int | None = None
     download_url: str | None = None
-    download_data: dict[str, Any] | None = None
     cover_data: dict[str, Any] | None = None
     credits_data: dict[str, Any] | None = None
     lyrics_data: dict[str, Any] | None = None
-    error: str | None = None
 
 
 class TrackDownloadInfo(msgspec.Struct, kw_only=True):
-    """Track download information."""
+    """Download payload returned by ``get_track_download`` /
+    ``get_video_download``.
+
+    Modules return ``DownloadEnum.DIRECT`` after writing the file to the
+    target path, or ``DownloadEnum.URL`` to let the framework fetch the
+    file. Video downloads always leave ``different_codec`` as ``None``.
+
+    Attributes:
+        download_type: How the framework should treat this payload.
+        file_url: Direct file URL (only for ``URL`` type).
+        file_url_headers: Optional HTTP headers for ``URL`` type.
+        temp_file_path: Optional temporary path for ``DIRECT`` type.
+        different_codec: Audio-only — set when the module decides to
+            deliver a different codec than requested (e.g. MQA → FLAC
+            fall-back). Always ``None`` for video downloads.
+    """
 
     download_type: DownloadEnum
     file_url: str | None = None
     file_url_headers: dict[str, str] | None = None
     temp_file_path: str | None = None
     different_codec: CodecEnum | None = None
+
+
+class VideoInfo(MediaInfo, kw_only=True):
+    """Music video metadata.
+
+    Inherits all common fields from :class:`MediaInfo` (including the
+    mandatory ``cover_url``) and adds the video-specific ``quality`` and
+    ``container`` fields. The ``quality`` field reports the *actually
+    selected* tier after variant matching by the module.
+
+    Attributes:
+        quality: Resolved video quality tier (closest match).
+        container: Output container chosen for this download.
+    """
+
+    quality: VideoQualityEnum = VideoQualityEnum.HIGH
+    container: VideoContainerEnum = VideoContainerEnum.mkv

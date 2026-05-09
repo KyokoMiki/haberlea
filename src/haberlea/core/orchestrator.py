@@ -14,6 +14,7 @@ from haberlea.downloader.contexts import (
     PlaylistQueueRequest,
     QueueingContext,
     TrackQueueRequest,
+    VideoQueueRequest,
 )
 from haberlea.downloader.facade import Downloader
 from haberlea.downloader.results import DownloadSummary
@@ -86,13 +87,20 @@ async def haberlea_core_download(request: DownloadRequest) -> DownloadSummary:
     gs = settings.global_settings
     haberlea_session = request.session
 
+    # Build a fresh batch of extension instances from current settings so
+    # that configuration edits made via the WebUI take effect on each new
+    # download, while batches already in flight keep their own snapshot.
+    extension_instances = haberlea_session.extension_manager.build_instances()
+
     extension_tasks: TaskGroup | None = None
 
     async def on_job_complete(job: DownloadJob) -> None:
         """Spawns background task to run extensions when job completes."""
         if extension_tasks is not None and job.definition.download_path:
             extension_tasks.start_soon(
-                haberlea_session.extension_manager.run_for_job, job
+                haberlea_session.extension_manager.run_for_job,
+                extension_instances,
+                job,
             )
 
     module_settings = haberlea_session.module_registry.state.module_settings
@@ -118,9 +126,7 @@ async def haberlea_core_download(request: DownloadRequest) -> DownloadSummary:
 
     downloader = Downloader(
         modules=haberlea_session.module_provider,
-        extensions=[
-            ext.instance for ext in haberlea_session.extension_manager.extensions
-        ],
+        extensions=[ext.instance for ext in extension_instances],
         path=request.output_path,
         queue=queue,
         third_party_modules=request.third_party_modules,
@@ -146,7 +152,7 @@ async def haberlea_core_download(request: DownloadRequest) -> DownloadSummary:
         extension_tasks = tg
         summary = await downloader.process_queue()
 
-    await haberlea_session.extension_manager.run_finalize()
+    await haberlea_session.extension_manager.run_finalize(extension_instances)
 
     return summary
 
@@ -239,6 +245,14 @@ async def _queue_media_item(
                         playlist_id=media_id,
                         original_url=media.original_url,
                         custom_module=custom_module_ref,
+                    )
+                )
+            case DownloadTypeEnum.video:
+                await ctx.downloader.queue_video(
+                    VideoQueueRequest(
+                        module=module_ref,
+                        video_id=media_id,
+                        original_url=media.original_url,
                     )
                 )
             case DownloadTypeEnum.artist:

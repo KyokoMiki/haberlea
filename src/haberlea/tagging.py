@@ -217,7 +217,7 @@ class BaseTagger(ABC):
 
     def _handle_save_failure(self, error: Exception) -> None:
         """Handles tagging failure by saving tags to text file."""
-        logging.debug("Tagging failed.")
+        logger.exception("Tagging failed for %s: %s", self.ctx.file_path, error)
         track = self.ctx.track_info
 
         tag_text = "\n".join(

@@ -30,6 +30,8 @@ if TYPE_CHECKING:
         SearchResult,
         TrackDownloadInfo,
         TrackInfo,
+        VideoInfo,
+        VideoQualityEnum,
     )
 
 
@@ -205,6 +207,58 @@ class ModuleBase(ABC):
 
         Returns:
             ArtistInfo containing metadata and album/track lists.
+        """
+        raise NotImplementedError
+
+    async def get_video_info(
+        self,
+        video_id: str,
+        quality_tier: "VideoQualityEnum",
+        data: dict[str, Any] | None = None,
+    ) -> "VideoInfo":
+        """Get music video metadata and HLS stream information.
+
+        Modules implementing this method must populate ``download_data`` so
+        that ``get_video_download`` can resume the download without redoing
+        the master/variant playlist resolution.
+
+        Args:
+            video_id: Unique identifier for the music video.
+            quality_tier: Desired video quality tier.
+            data: Optional pre-fetched video data.
+
+        Returns:
+            VideoInfo containing metadata and resolved variant payload.
+
+        Raises:
+            NotImplementedError: If the module does not support video downloads.
+        """
+        raise NotImplementedError
+
+    async def get_video_download(
+        self,
+        target_path: Path,
+        url: str = "",
+        data: dict | None = None,
+    ) -> "TrackDownloadInfo":
+        """Download a music video to ``target_path``.
+
+        The default contract is ``DownloadEnum.DIRECT``: the module fetches
+        all HLS segments, optionally remuxes the result, and places the
+        final file at ``target_path``.
+
+        Args:
+            target_path: Final output file path (extension already chosen
+                by the framework based on the configured container).
+            url: Optional source URL hint.
+            data: Module payload from ``VideoInfo.download_data``.
+
+        Returns:
+            TrackDownloadInfo describing the download outcome
+            (``different_codec`` is unused for videos).
+
+        Raises:
+            NotImplementedError: If the module does not support video downloads.
         """
         raise NotImplementedError
 

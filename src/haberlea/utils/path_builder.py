@@ -8,7 +8,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any
 
-from .models import AlbumInfo, DownloadTypeEnum, PlaylistInfo, TrackInfo
+from .models import AlbumInfo, DownloadTypeEnum, PlaylistInfo, TrackInfo, VideoInfo
 from .settings import FormattingSettings
 from .utils import fix_byte_limit, sanitise_name
 
@@ -290,3 +290,52 @@ class PathBuilder:
         track_location_name = fix_byte_limit(track_location_name)
 
         return track_location_name
+
+    def build_video_path(
+        self,
+        video_info: VideoInfo,
+        video_id: str = "",
+    ) -> Path:
+        """Build music video file path (without extension).
+
+        Args:
+            video_info: Resolved video metadata.
+            video_id: Optional video identifier (exposed as ``{id}`` in format).
+
+        Returns:
+            Full video file path *without* extension. Callers must append
+            the container suffix (``.mp4`` / ``.mkv``) themselves.
+        """
+        video_tags: dict[str, Any] = {
+            "name": sanitise_name(video_info.name),
+            "artist": (
+                sanitise_name(video_info.artists[0])
+                if video_info.artists
+                else "Unknown Artist"
+            ),
+            "artists": sanitise_name(", ".join(video_info.artists)),
+            "release_year": sanitise_name(str(video_info.release_year)),
+            "duration": (
+                sanitise_name(str(video_info.duration)) if video_info.duration else None
+            ),
+            "explicit": " [E]" if video_info.explicit else "",
+            "quality": f" [{video_info.quality.value}]",
+            "id": sanitise_name(video_id) if video_id else "",
+        }
+
+        try:
+            video_path = self.base_path / self._formatting.video_format.format(
+                **video_tags
+            )
+        except (KeyError, ValueError):
+            # Fallback to a safe default format when user format has missing
+            # keys or invalid syntax.
+            video_path = (
+                self.base_path
+                / "Videos"
+                / f"{video_tags['artist']} - {video_tags['name']}"
+                f"{video_tags['explicit']}"
+            )
+        video_path = fix_byte_limit(video_path)
+
+        return video_path

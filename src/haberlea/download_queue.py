@@ -22,8 +22,10 @@ from .downloader.results import DownloadSummary, FailedTrack
 from .plugins.base import ModuleBase
 from .utils.models import (
     CodecOptions,
+    MediaKindEnum,
     QualityEnum,
     TrackInfo,
+    VideoInfo,
 )
 from .utils.progress import (
     ProgressStatus,
@@ -99,6 +101,7 @@ class TrackProgressMap:
     def __init__(self) -> None:
         self.track_ids: list[str] = []
         self.track_infos: dict[str, TrackInfo] = {}
+        self.video_infos: dict[str, VideoInfo] = {}
         self._outcomes: dict[str, ProgressStatus] = {}
 
     # ------------------------------------------------------------------
@@ -116,6 +119,10 @@ class TrackProgressMap:
     def store_info(self, track_id: str, info: TrackInfo) -> None:
         """Store fetched TrackInfo for extension callbacks."""
         self.track_infos[track_id] = info
+
+    def store_video_info(self, video_id: str, info: VideoInfo) -> None:
+        """Store fetched VideoInfo for extension callbacks."""
+        self.video_infos[video_id] = info
 
     # ------------------------------------------------------------------
     # Read-only views
@@ -220,19 +227,26 @@ class DownloadJob:
 
 
 class TrackTask(msgspec.Struct):
-    """A single track download task.
+    """A single download task (audio track or music video).
+
+    Music videos reuse this struct with ``media_kind=MediaKindEnum.video``
+    so the queue, orchestrator, and webui can stay media-kind agnostic.
+    Video tasks ignore the audio-specific ``track_index`` / ``total_tracks``
+    fields.
 
     Attributes:
-        track_id: The track identifier.
-        job_id: The job this track belongs to.
+        track_id: The track or video identifier.
+        job_id: The job this task belongs to.
         module_name: The module to use for downloading.
         module: The loaded module instance.
-        download_path: Path to save the track.
-        track_index: Track number in album/playlist.
-        total_tracks: Total tracks in album/playlist.
-        main_artist: Main artist name for filtering.
-        track_data: Pre-fetched track data from album/playlist/artist.
+        download_path: Path to save the file.
+        track_index: Track number in album/playlist (audio only).
+        total_tracks: Total tracks in album/playlist (audio only).
+        main_artist: Main artist name for filtering / display.
+        track_data: Pre-fetched payload (audio TrackInfo data or video
+            metadata, interpreted by the module).
         account_index: Account index used for this task.
+        media_kind: Audio or video execution path.
     """
 
     track_id: str
@@ -245,6 +259,7 @@ class TrackTask(msgspec.Struct):
     main_artist: str = ""
     track_data: dict[str, Any] | None = None
     account_index: int = 0
+    media_kind: MediaKindEnum = MediaKindEnum.audio
 
 
 # Type alias for job completion callback
@@ -378,7 +393,7 @@ class DownloadQueue:
         return self._state.jobs.get(job_id)
 
     def get_track_task(self, track_id: str) -> TrackTask | None:
-        """Gets a track task by ID."""
+        """Gets a track or video task by ID."""
         return self._state.track_tasks.get(track_id)
 
     def get_all_jobs(self) -> list[DownloadJob]:
@@ -386,7 +401,7 @@ class DownloadQueue:
         return list(self._state.jobs.values())
 
     def get_all_track_tasks(self) -> list[TrackTask]:
-        """Gets all track tasks in the queue."""
+        """Gets all tasks in the queue (audio + video)."""
         return list(self._state.track_tasks.values())
 
     @property
@@ -396,7 +411,7 @@ class DownloadQueue:
 
     @property
     def track_count(self) -> int:
-        """Returns number of track tasks in the queue."""
+        """Returns number of tasks in the queue (audio + video)."""
         return len(self._state.track_tasks)
 
     async def mark_track_complete(
@@ -404,10 +419,10 @@ class DownloadQueue:
         track_id: str,
         status: ProgressStatus = ProgressStatus.COMPLETED,
     ) -> None:
-        """Marks a track as complete and updates job status.
+        """Marks a task as complete and updates job status.
 
         Args:
-            track_id: The track identifier.
+            track_id: The task identifier (audio track or video).
             status: The completion status (COMPLETED, FAILED, or SKIPPED).
         """
         task = self._state.track_tasks.get(track_id)
@@ -468,7 +483,7 @@ class DownloadQueue:
             message=progress_update.message,
         )
 
-        # Update job status to DOWNLOADING when first track starts
+        # Update job status to DOWNLOADING when first task starts
         async with self._state.job_lock:
             task = self._state.track_tasks.get(progress_update.track_id)
             if task and progress_update.status == ProgressStatus.DOWNLOADING:

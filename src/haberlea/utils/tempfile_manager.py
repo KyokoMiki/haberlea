@@ -11,7 +11,7 @@ Features:
 """
 
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from tempfile import gettempdir
@@ -77,7 +77,7 @@ class TempFileManager:
         self,
         suffix: str = "",
         prefix: str | None = None,
-    ) -> AsyncIterator[Path]:
+    ) -> AsyncGenerator[Path]:
         """Create a temporary file path with automatic cleanup.
 
         The file is created but immediately closed, allowing the caller to
@@ -108,7 +108,7 @@ class TempFileManager:
         self,
         suffix: str = "",
         prefix: str | None = None,
-    ) -> AsyncIterator[Path]:
+    ) -> AsyncGenerator[Path]:
         """Create a temporary directory with automatic cleanup via anyio.
 
         Args:

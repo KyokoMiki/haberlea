@@ -18,9 +18,10 @@ from haberlea.downloader.contexts import (
     JobDefinition,
     PlaylistQueueRequest,
     TrackQueueRequest,
+    VideoQueueRequest,
     build_artwork_settings,
 )
-from haberlea.utils.models import DownloadTypeEnum
+from haberlea.utils.models import DownloadTypeEnum, MediaKindEnum
 from haberlea.utils.settings import (
     ArtistDownloadingSettings,
     CoversSettings,
@@ -113,6 +114,45 @@ class QueueBuilder:
         )
         await self.queue.add_track(job_id, task)
         logger.debug("Queued track: %s", track_id)
+        return job_id
+
+    async def queue_video(self, request: VideoQueueRequest) -> str:
+        """Queues a single music video for download.
+
+        Builds a ``TrackTask`` with ``media_kind=MediaKindEnum.video`` so
+        the queue, orchestrator, and webui can stay media-kind agnostic.
+
+        Args:
+            request: Video queue request.
+
+        Returns:
+            The job ID for this download.
+        """
+        module_name = request.module.name
+        module = request.module.instance
+        video_id = request.video_id
+
+        job_id = await self.queue.create_job(
+            JobDefinition(
+                original_url=request.original_url or f"{module_name}:video:{video_id}",
+                media_type=DownloadTypeEnum.video,
+                media_id=video_id,
+                module_name=module_name,
+                download_path=self._path_builder.base_path,
+            )
+        )
+
+        task = TrackTask(
+            track_id=video_id,
+            job_id=job_id,
+            module_name=module_name,
+            module=module,
+            download_path=self._path_builder.base_path,
+            track_data=request.video_data,
+            media_kind=MediaKindEnum.video,
+        )
+        await self.queue.add_track(job_id, task)
+        logger.debug("Queued video: %s", video_id)
         return job_id
 
     async def queue_album(

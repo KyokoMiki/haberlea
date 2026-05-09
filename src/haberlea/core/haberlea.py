@@ -17,7 +17,7 @@ from .module_registry import ModuleRegistry, RegistryState
 from .session_manager import SessionManager
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncGenerator
 
     from haberlea.downloader.protocols import ModuleProvider
     from haberlea.downloader.results import ModuleWithAccount
@@ -90,7 +90,6 @@ class Haberlea:
             discovered=reconcile_result.discovered_extensions,
             extension_list=reconcile_result.extension_list,
         )
-        extension_manager.initialize()
 
         return cls(
             module_registry=module_registry,
@@ -173,7 +172,7 @@ class Haberlea:
 async def create_haberlea_session(
     bootstrap_result: BootstrapResult,
     reconcile_result: ReconcileResult,
-) -> AsyncIterator[Haberlea]:
+) -> AsyncGenerator[Haberlea]:
     """Creates a Haberlea session with automatic cleanup.
 
     Args:
