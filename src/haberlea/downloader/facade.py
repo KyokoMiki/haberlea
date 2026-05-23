@@ -125,6 +125,7 @@ class Downloader:
         exc_tb: object,
     ) -> None:
         """Exit async context manager."""
+        await self._asset_manager.cleanup()
 
     # ------------------------------------------------------------------
     # Queue population (delegates to QueueBuilder)
@@ -176,6 +177,7 @@ class Downloader:
             for task in tasks:
                 tg.start_soon(self._process_track, task)
 
+        await self._asset_manager.cleanup()
         return self._queue.get_results()
 
     async def _process_track(self, task: TrackTask) -> None:

@@ -53,19 +53,19 @@ class TempFileManager:
     def __init__(
         self,
         base_dir: Path | str | None = None,
-        prefix: str = "haberlea_",
+        prefix: str = "",
     ) -> None:
         """Initialize the temporary file manager.
 
         Args:
-            base_dir: Base directory for temporary files. If None, uses the
-                temp_path from settings, or system temp directory if not configured.
+            base_dir: Base directory for temporary files. If None, uses
+                a ``haberlea`` subdirectory under the system temp directory.
             prefix: Prefix for temporary file/directory names.
         """
         if base_dir:
             self._base_dir = Path(base_dir)
         else:
-            self._base_dir = Path(gettempdir())
+            self._base_dir = Path(gettempdir()) / "haberlea"
 
         # Ensure base directory exists
         self._base_dir.mkdir(parents=True, exist_ok=True)

@@ -41,12 +41,14 @@ dev = ["ruff"]
 
 [tool.ruff]
 target-version = "py311"
+extend-exclude = ["*_pb2.py", "*_pb2_grpc.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "UP", "B", "SIM", "I", "TC", "C90", "PLC0415", "TID"]
 
 [tool.pyright]
 include = ["src"]
+ignore = ["**/*_pb2.py", "**/*_pb2_grpc.py"]
 typeCheckingMode = "standard"
 reportPossiblyUnboundVariable = "error"
 reportUnreachable = false

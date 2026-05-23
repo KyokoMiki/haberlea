@@ -106,6 +106,14 @@ class CoverCache:
 
         return result
 
+    async def cleanup(self) -> None:
+        """Delete all cached cover temp files from disk."""
+        async with self._lock:
+            for path in self._cache.values():
+                if path is not None:
+                    await anyio.Path(path).unlink(missing_ok=True)
+            self._cache.clear()
+
 
 class AssetManager:
     """Fetches cover art, lyrics, and credits for tracks.
@@ -137,6 +145,10 @@ class AssetManager:
         self._modules = modules
         self._temp = temp
         self._cover_cache = CoverCache()
+
+    async def cleanup(self) -> None:
+        """Clean up temporary cover files held in cache."""
+        await self._cover_cache.cleanup()
 
     # ------------------------------------------------------------------
     # Public API

@@ -12,7 +12,7 @@ import operator
 import re
 import shutil
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from functools import reduce
 from pathlib import Path
 from time import gmtime, strftime
@@ -24,9 +24,10 @@ import msgspec
 from asyncer import asyncify
 from PIL import Image, ImageChops
 from tenacity import (
+    AsyncRetrying,
     before_sleep_log,
-    retry,
     retry_if_exception_type,
+    retry_if_not_exception_type,
     stop_after_attempt,
     wait_exponential,
 )
@@ -182,20 +183,13 @@ def _process_artwork(
         im.save(str(file_location), new_format, quality=new_compression)
 
 
-@retry(
-    retry=retry_if_exception_type((aiohttp.ClientError, TimeoutError)),
-    stop=stop_after_attempt(10),
-    wait=wait_exponential(multiplier=0.4, min=0.4, max=60),
-    reraise=True,
-    before_sleep=before_sleep_log(logger, logging.WARNING),
-)
-async def _download_with_retry(
+async def _download_once(
     url: str,
     file_location: Path,
     session: aiohttp.ClientSession,
     config: DownloadConfig,
 ) -> None:
-    """Download file with retry logic.
+    """Download a file in a single attempt.
 
     Args:
         url: URL to download from.
@@ -229,6 +223,7 @@ async def download_file(
     file_location: Path,
     config: DownloadConfig | None = None,
     session: aiohttp.ClientSession | None = None,
+    passthrough_errors: tuple[type[BaseException], ...] = (),
 ) -> None:
     """Downloads a file asynchronously using aiohttp with automatic retry.
 
@@ -241,6 +236,9 @@ async def download_file(
         config: Optional download configuration (headers, task_id, chunk_processor,
             chunk_size). Defaults to DownloadConfig() with sensible defaults.
         session: Optional aiohttp session to reuse.
+        passthrough_errors: Exception types that bypass retry and are raised
+            immediately. Useful when the caller has its own fallback logic
+            for specific error classes.
 
     Raises:
         KeyboardInterrupt: If the download is interrupted by the user.
@@ -275,7 +273,21 @@ async def download_file(
     )
 
     try:
-        await _download_with_retry(url, file_location, session, effective_config)
+        retry_condition = retry_if_exception_type((aiohttp.ClientError, TimeoutError))
+        if passthrough_errors:
+            retry_condition = retry_condition & retry_if_not_exception_type(
+                passthrough_errors
+            )
+
+        async for attempt in AsyncRetrying(
+            retry=retry_condition,
+            stop=stop_after_attempt(10),
+            wait=wait_exponential(multiplier=0.4, min=0.4, max=60),
+            reraise=True,
+            before_sleep=before_sleep_log(logger, logging.WARNING),
+        ):
+            with attempt:
+                await _download_once(url, file_location, session, effective_config)
     except KeyboardInterrupt:
         if file_location.is_file():
             logger.warning('Deleting partially downloaded file "%s"', file_location)
@@ -284,6 +296,164 @@ async def download_file(
     finally:
         if close_session:
             await session.close()
+
+
+# ---------------------------------------------------------------------------
+# Segmented download (disk-pipelined)
+# ---------------------------------------------------------------------------
+
+_SEGMENT_HTTP_CHUNK = 64 * 1024
+
+
+async def _fetch_segment(
+    session: aiohttp.ClientSession,
+    url: str,
+    headers: dict[str, str] | None = None,
+) -> bytes:
+    """Fetch a single segment into memory with retry.
+
+    Args:
+        session: aiohttp client session.
+        url: Segment URL.
+        headers: Optional HTTP headers.
+
+    Returns:
+        Raw segment bytes.
+    """
+    async for attempt in AsyncRetrying(
+        retry=retry_if_exception_type((aiohttp.ClientError, TimeoutError)),
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=0.4, min=0.4, max=30),
+        reraise=True,
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+    ):
+        with attempt:
+            async with session.get(url, ssl=False, headers=headers) as response:
+                response.raise_for_status()
+                return await response.read()
+    raise RuntimeError("Unreachable")  # pragma: no cover
+
+
+async def _run_download_pipeline(
+    urls: Sequence[str],
+    output_paths: list[Path],
+    session: aiohttp.ClientSession,
+    max_concurrency: int,
+    segment_processor: Callable[[bytes, int], bytes] | None,
+    task_id: str | None,
+    headers: dict[str, str] | None,
+) -> None:
+    """Fetch segments concurrently and write results in order.
+
+    Args:
+        urls: Ordered segment URLs.
+        output_paths: Pre-computed output file paths (one per segment).
+        session: aiohttp client session.
+        max_concurrency: Parallel fetch cap.
+        segment_processor: Optional per-segment transform.
+        task_id: Progress task ID (may be ``None``).
+        headers: Optional HTTP headers.
+    """
+    n = len(urls)
+    buffers: list[bytes | None] = [None] * n
+    ready = [anyio.Event() for _ in range(n)]
+    limiter = anyio.CapacityLimiter(max(1, max_concurrency))
+
+    async def _producer(i: int) -> None:
+        async with limiter:
+            buffers[i] = await _fetch_segment(session, urls[i], headers)
+        ready[i].set()
+
+    async def _consumer() -> None:
+        for i in range(n):
+            await ready[i].wait()
+            data = buffers[i]
+            assert data is not None
+            buffers[i] = None
+            if segment_processor is not None:
+                data = segment_processor(data, i)
+            await anyio.Path(output_paths[i]).write_bytes(data)
+            del data
+            if task_id:
+                await advance(task_id, 1, n)
+
+    async with anyio.create_task_group() as tg:
+        for i in range(n):
+            tg.start_soon(_producer, i)
+        tg.start_soon(_consumer)
+
+
+async def download_segments(
+    urls: Sequence[str],
+    target_dir: Path,
+    *,
+    session: aiohttp.ClientSession | None = None,
+    max_concurrency: int = 4,
+    segment_processor: Callable[[bytes, int], bytes] | None = None,
+    task_id: str | None = None,
+    headers: dict[str, str] | None = None,
+) -> list[Path]:
+    """Download segments in parallel and write to *target_dir*.
+
+    Up to *max_concurrency* segments are fetched concurrently. A single
+    sequential consumer applies the optional *segment_processor* and
+    writes each result directly to *target_dir*. No intermediate temp
+    files are created.
+
+    Args:
+        urls: Ordered sequence of segment URLs.
+        target_dir: Directory to write segment files into.
+        session: aiohttp client session. Created and closed internally
+            when ``None``.
+        max_concurrency: Maximum number of parallel segment downloads.
+        segment_processor: Optional ``(data, segment_index) → bytes``
+            transform applied in strict order. Stateful closures are
+            safe (consumer processes 0, 1, 2, … sequentially).
+        task_id: Task ID for progress reporting. Falls back to
+            :func:`get_current_task` when ``None``.
+        headers: Optional HTTP headers sent with each segment request.
+
+    Returns:
+        Ordered list of segment file paths.
+
+    Raises:
+        aiohttp.ClientError: After exhausting per-segment retries.
+        KeyboardInterrupt: Partial output is removed before re-raising.
+    """
+    if not urls:
+        return []
+
+    effective_task_id = task_id or get_current_task()
+    if effective_task_id:
+        reset(effective_task_id)
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    close_session = False
+    if session is None:
+        session = create_aiohttp_session()
+        close_session = True
+
+    output_paths = [target_dir / f"seg_{i:05d}" for i in range(len(urls))]
+
+    try:
+        await _run_download_pipeline(
+            urls,
+            output_paths,
+            session,
+            max_concurrency,
+            segment_processor,
+            effective_task_id,
+            headers,
+        )
+    except KeyboardInterrupt:
+        silentremove(target_dir)
+        raise KeyboardInterrupt from None
+    finally:
+        if close_session:
+            await session.close()
+
+    return output_paths
 
 
 def compare_images(image_1: Path, image_2: Path) -> float:

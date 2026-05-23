@@ -27,6 +27,23 @@ if TYPE_CHECKING:
 MAX_VISIBLE_TRACKS = 50
 
 
+def _fmt_pct(progress: float) -> str:
+    """Format a 0-1 progress ratio as a human-friendly percentage string.
+
+    At most one decimal place is shown; trailing ".0" is dropped.
+
+    Args:
+        progress: Progress ratio in [0.0, 1.0].
+
+    Returns:
+        Formatted percentage, e.g. ``"0%"``, ``"33.3%"``, ``"100%"``.
+    """
+    pct = round(progress * 100, 1)
+    if pct in (0.0, 100.0):
+        return f"{int(pct)}%"
+    return f"{pct:.1f}%"
+
+
 class DownloadPage:
     """Download page — pure view over the module-level download service."""
 
@@ -363,9 +380,21 @@ class DownloadPage:
                         status_text += f" ({job.failed} {_('failed')})"
                     ui.label(status_text).classes("text-xs text-gray-500")
 
-                ui.linear_progress(
-                    value=round(job.progress, 2), show_value=True
-                ).classes("w-32")
+                with (
+                    ui.linear_progress(value=round(job.progress, 2), show_value=False)
+                    .props('size="20px"')
+                    .classes("w-32")
+                ):
+                    pct_pos = round(job.progress * 100, 1)
+                    bg = f"linear-gradient(to right,white {pct_pos}%,black {pct_pos}%)"
+                    ui.label(_fmt_pct(job.progress)).classes("text-xs").style(
+                        "position:absolute;inset:0;"
+                        "display:flex;align-items:center;"
+                        "justify-content:center;font-weight:bold;"
+                        f"color:transparent;background:{bg};"
+                        "-webkit-background-clip:text;"
+                        "background-clip:text;"
+                    )
 
             if job.track_ids:
                 expansion = ui.expansion(
@@ -443,7 +472,21 @@ class DownloadPage:
                 ui.label(track.message).classes("text-xs text-gray-500")
 
             if track.status == "downloading":
-                ui.linear_progress(value=round(track.progress, 2)).classes("w-20")
+                with (
+                    ui.linear_progress(value=round(track.progress, 2), show_value=False)
+                    .props('size="20px"')
+                    .classes("w-20")
+                ):
+                    pct_pos = round(track.progress * 100, 1)
+                    bg = f"linear-gradient(to right,white {pct_pos}%,black {pct_pos}%)"
+                    ui.label(_fmt_pct(track.progress)).classes("text-xs").style(
+                        "position:absolute;inset:0;"
+                        "display:flex;align-items:center;"
+                        "justify-content:center;font-weight:bold;"
+                        f"color:transparent;background:{bg};"
+                        "-webkit-background-clip:text;"
+                        "background-clip:text;"
+                    )
 
     def _on_expansion_change(self, job_id: str, value: bool) -> None:
         """Record expansion state so refreshes preserve it.
