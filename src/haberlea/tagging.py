@@ -278,7 +278,15 @@ class FLACTagger(BaseTagger):
             return
         for credit in self.ctx.credits_list:
             if isinstance(tagger.tags, VCFLACDict) and credit.names:
-                tagger.tags[credit.type] = credit.names
+                try:
+                    tagger.tags[credit.type] = credit.names
+                except ValueError:
+                    logger.exception(
+                        "Failed to set FLAC credit tag: type=%r names=%r",
+                        credit.type,
+                        credit.names,
+                    )
+                    raise
 
     def _set_extra_tags(self) -> None:
         """Sets extra custom tags for FLAC files."""
@@ -318,7 +326,15 @@ class OggBaseTagger(BaseTagger, ABC):
             return
         for credit in self.ctx.credits_list:
             if tagger.tags is not None and credit.names:
-                tagger.tags[credit.type] = credit.names
+                try:
+                    tagger.tags[credit.type] = credit.names
+                except ValueError:
+                    logger.exception(
+                        "Failed to set Ogg credit tag: type=%r names=%r",
+                        credit.type,
+                        credit.names,
+                    )
+                    raise
 
     def _set_extra_tags(self) -> None:
         """Sets extra custom tags."""

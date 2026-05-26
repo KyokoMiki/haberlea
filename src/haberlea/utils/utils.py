@@ -334,30 +334,71 @@ async def _fetch_segment(
     raise RuntimeError("Unreachable")  # pragma: no cover
 
 
-async def _run_download_pipeline(
+async def _run_direct_pipeline(
     urls: Sequence[str],
     output_paths: list[Path],
     session: aiohttp.ClientSession,
     max_concurrency: int,
-    segment_processor: Callable[[bytes, int], bytes] | None,
     task_id: str | None,
     headers: dict[str, str] | None,
 ) -> None:
-    """Fetch segments concurrently and write results in order.
+    """Fetch segments concurrently, each written to disk immediately.
+
+    Memory usage is bounded to at most *max_concurrency* in-flight
+    segments since each producer writes its file as soon as the download
+    completes.
 
     Args:
         urls: Ordered segment URLs.
         output_paths: Pre-computed output file paths (one per segment).
         session: aiohttp client session.
         max_concurrency: Parallel fetch cap.
-        segment_processor: Optional per-segment transform.
         task_id: Progress task ID (may be ``None``).
         headers: Optional HTTP headers.
     """
     n = len(urls)
+    limiter = anyio.CapacityLimiter(max(1, max_concurrency))
+
+    async def _producer(i: int) -> None:
+        async with limiter:
+            data = await _fetch_segment(session, urls[i], headers)
+            await anyio.Path(output_paths[i]).write_bytes(data)
+        if task_id:
+            await advance(task_id, 1)
+
+    async with anyio.create_task_group() as tg:
+        for i in range(n):
+            tg.start_soon(_producer, i)
+
+
+async def _run_ordered_pipeline(
+    urls: Sequence[str],
+    output_paths: list[Path],
+    session: aiohttp.ClientSession,
+    max_concurrency: int,
+    segment_processor: Callable[[bytes, int], bytes],
+    task_id: str | None,
+    headers: dict[str, str] | None,
+) -> None:
+    """Fetch segments concurrently, process and write in strict order.
+
+    Required when *segment_processor* is stateful and expects sequential
+    indices. Segments that arrive out of order are buffered until their
+    turn.
+
+    Args:
+        urls: Ordered segment URLs.
+        output_paths: Pre-computed output file paths (one per segment).
+        session: aiohttp client session.
+        max_concurrency: Parallel fetch cap.
+        segment_processor: Per-segment ``(data, index) → bytes`` transform.
+        task_id: Progress task ID (may be ``None``).
+        headers: Optional HTTP headers.
+    """
+    n = len(urls)
+    limiter = anyio.CapacityLimiter(max(1, max_concurrency))
     buffers: list[bytes | None] = [None] * n
     ready = [anyio.Event() for _ in range(n)]
-    limiter = anyio.CapacityLimiter(max(1, max_concurrency))
 
     async def _producer(i: int) -> None:
         async with limiter:
@@ -370,12 +411,12 @@ async def _run_download_pipeline(
             data = buffers[i]
             assert data is not None
             buffers[i] = None
-            if segment_processor is not None:
-                data = segment_processor(data, i)
-            await anyio.Path(output_paths[i]).write_bytes(data)
+            data = segment_processor(data, i)
+            if data:
+                await anyio.Path(output_paths[i]).write_bytes(data)
             del data
             if task_id:
-                await advance(task_id, 1, n)
+                await advance(task_id, 1)
 
     async with anyio.create_task_group() as tg:
         for i in range(n):
@@ -424,8 +465,9 @@ async def download_segments(
         return []
 
     effective_task_id = task_id or get_current_task()
-    if effective_task_id:
+    if effective_task_id and not task_id:
         reset(effective_task_id)
+        await update(effective_task_id, total=len(urls), mode=ProgressMode.PERCENT)
 
     target_dir.mkdir(parents=True, exist_ok=True)
 
@@ -437,15 +479,25 @@ async def download_segments(
     output_paths = [target_dir / f"seg_{i:05d}" for i in range(len(urls))]
 
     try:
-        await _run_download_pipeline(
-            urls,
-            output_paths,
-            session,
-            max_concurrency,
-            segment_processor,
-            effective_task_id,
-            headers,
-        )
+        if segment_processor is None:
+            await _run_direct_pipeline(
+                urls,
+                output_paths,
+                session,
+                max_concurrency,
+                effective_task_id,
+                headers,
+            )
+        else:
+            await _run_ordered_pipeline(
+                urls,
+                output_paths,
+                session,
+                max_concurrency,
+                segment_processor,
+                effective_task_id,
+                headers,
+            )
     except KeyboardInterrupt:
         silentremove(target_dir)
         raise KeyboardInterrupt from None

@@ -9,7 +9,9 @@ Built with asyncclick for Python 3.14+, featuring:
 
 import logging
 import re
+import shutil
 from pathlib import Path
+from tempfile import gettempdir
 from urllib.parse import urlparse
 
 import asyncclick as click
@@ -759,20 +761,81 @@ async def download_command(
 
 
 # =============================================================================
-# Clear Session Command
+# Clean Temporary Files Command
 # =============================================================================
 
 
-@cli.command("clear")
+@cli.command("clean")
+@click.option(
+    "-y",
+    "--yes",
+    is_flag=True,
+    help="Skip confirmation prompt.",
+)
+def clean_command(yes: bool) -> None:
+    """Clean the temporary files directory.
+
+    Removes all files and subdirectories under the configured temporary
+    files path (or the default ``haberlea`` subdirectory under the system
+    temp directory if not configured).
+
+    \b
+    Examples:
+        haberlea clean
+        haberlea clean -y
+    """
+    configured = settings.global_settings.runtime.temp_path
+    temp_dir = Path(configured) if configured else Path(gettempdir()) / "haberlea"
+
+    if not temp_dir.exists():
+        click.echo(f"Temporary directory does not exist: {temp_dir}")
+        return
+
+    if not yes:
+        click.confirm(
+            f"This will delete all contents of: {temp_dir}\nContinue?",
+            abort=True,
+        )
+
+    removed_files = 0
+    removed_dirs = 0
+    errors: list[str] = []
+
+    for entry in temp_dir.iterdir():
+        try:
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+                removed_dirs += 1
+            else:
+                entry.unlink()
+                removed_files += 1
+        except OSError as e:
+            errors.append(f"{entry}: {e}")
+
+    click.echo(
+        f"Cleaned {temp_dir}: {removed_files} files, {removed_dirs} directories removed."
+    )
+    if errors:
+        click.echo(f"Failed to remove {len(errors)} entries:", err=True)
+        for msg in errors:
+            click.echo(f"  - {msg}", err=True)
+
+
+# =============================================================================
+# Logout Command
+# =============================================================================
+
+
+@cli.command("logout")
 @click.argument("module")
 @click.pass_context
-async def clear_session(ctx: click.Context, module: str) -> None:
+async def logout_command(ctx: click.Context, module: str) -> None:
     """Clear session data for a module to force re-login.
 
     \b
     Examples:
-        haberlea clear deezer
-        haberlea clear qobuz
+        haberlea logout deezer
+        haberlea logout qobuz
     """
     ensure_haberlea(ctx)
 

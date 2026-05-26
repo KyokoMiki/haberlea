@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 import aiohttp
 from tenacity import (
+    before_sleep_log,
     retry,
     retry_if_exception_type,
     stop_after_attempt,
@@ -170,6 +171,7 @@ class TrackDownloader:
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=30),
         reraise=True,
+        before_sleep=before_sleep_log(logger, logging.WARNING),
     )
     async def download(self, task: TrackTask) -> TrackDownloadOutput:
         """Downloads a single track or music video.
