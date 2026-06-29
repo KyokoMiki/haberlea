@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from haberlea.downloader.protocols import ModuleProvider
     from haberlea.downloader.results import ModuleWithAccount
     from haberlea.plugins.base import ModuleBase
+    from haberlea.utils.auth_prompter import AuthPrompter
 
     from .bootstrap import BootstrapResult, ReconcileResult
 
@@ -63,12 +64,16 @@ class Haberlea:
         cls,
         bootstrap_result: BootstrapResult,
         reconcile_result: ReconcileResult,
+        auth_prompter: AuthPrompter | None = None,
     ) -> Haberlea:
         """Builds a Haberlea instance from bootstrap + reconcile results.
 
         Args:
             bootstrap_result: Result from the bootstrap phase.
             reconcile_result: Result from the reconcile phase.
+            auth_prompter: Channel for interactive login prompts. Defaults to
+                a terminal-backed prompter (``CliAuthPrompter``); the WebUI
+                injects its own implementation here.
 
         Returns:
             Fully configured Haberlea instance.
@@ -84,6 +89,7 @@ class Haberlea:
         module_registry = ModuleRegistry(
             session_manager=session_manager,
             initial_state=state,
+            auth_prompter=auth_prompter,
         )
 
         extension_manager = ExtensionManager(

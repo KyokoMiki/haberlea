@@ -15,7 +15,8 @@ from haberlea.i18n import _, set_language
 from haberlea.utils.settings import NICEGUI_STORAGE_DIR, SETTINGS_PATH, settings
 
 from .auth import AuthMiddleware, create_login_page
-from .download_service import init_download_service
+from .download_service import WebUiAuthPrompter, init_download_service
+from .pages.auth_prompt import AuthPromptDialog
 from .pages.download import DownloadPage
 from .pages.logs import LogsPage
 from .pages.search import SearchPage
@@ -169,6 +170,9 @@ def index_page() -> None:
         with ui.tab_panel("logs"):
             logs_page.render()
 
+    # Global interactive-login dialog, shared across tabs.
+    AuthPromptDialog().render()
+
 
 def main() -> None:
     """Main entry point for Haberlea WebUI.
@@ -195,8 +199,14 @@ def main() -> None:
         )
         raise SystemExit(0)
 
-    # Build and store global Haberlea singleton
-    haberlea = Haberlea.from_reconciled(bootstrap_result, reconcile_result)
+    # Build and store global Haberlea singleton. Inject the WebUI prompter so
+    # interactive logins (TIDAL/Amazon/KKBOX) surface in the browser instead
+    # of stdin/stdout.
+    haberlea = Haberlea.from_reconciled(
+        bootstrap_result,
+        reconcile_result,
+        auth_prompter=WebUiAuthPrompter(),
+    )
     init_haberlea(haberlea)
     init_download_service(haberlea)
 

@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any
 
 import msgspec
 
+from .auth_prompter import AuthPrompter, CliAuthPrompter
 from .exceptions import InvalidInput
 from .utils import read_temporary_setting, set_temporary_setting
 
@@ -462,6 +463,7 @@ class ModuleController(msgspec.Struct):
     temporary_settings_controller: TemporarySettingsController
     haberlea_options: HabeleaOptions
     get_current_timestamp: Callable[[], int]
+    auth_prompter: AuthPrompter = msgspec.field(default_factory=CliAuthPrompter)
 
 
 class Tags(msgspec.Struct, kw_only=True):

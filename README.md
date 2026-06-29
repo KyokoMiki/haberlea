@@ -1,3 +1,3 @@
 # Haberlea
 
-Haberlea Rhodopensis - "Orpheus Flower"
+_Haberlea rhodopensis_ - "Orpheus Flower"

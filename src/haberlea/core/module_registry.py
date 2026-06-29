@@ -7,6 +7,7 @@ from haberlea.downloader.contexts import LoginContext
 from haberlea.downloader.results import ModuleWithAccount
 from haberlea.plugins.base import ModuleBase
 from haberlea.plugins.loader import load_module
+from haberlea.utils.auth_prompter import AuthPrompter, CliAuthPrompter
 from haberlea.utils.exceptions import ConfigurationError, InvalidModuleError
 from haberlea.utils.models import (
     CoverCompressionEnum,
@@ -51,10 +52,12 @@ class ModuleRegistry:
         self,
         session_manager: SessionManager,
         initial_state: RegistryState | None = None,
+        auth_prompter: AuthPrompter | None = None,
     ) -> None:
         self._config_dir = CONFIG_DIR
         self._session_manager = session_manager
         self.state = initial_state or RegistryState()
+        self._auth_prompter: AuthPrompter = auth_prompter or CliAuthPrompter()
 
     def get_module_flags(self, name: str) -> ModuleFlags | None:
         """Returns the flags for the named module.
@@ -262,6 +265,7 @@ class ModuleRegistry:
             ),
             get_current_timestamp=get_utc_timestamp,
             haberlea_options=self._build_haberlea_options(),
+            auth_prompter=self._auth_prompter,
         )
 
     def _build_haberlea_options(self) -> HabeleaOptions:

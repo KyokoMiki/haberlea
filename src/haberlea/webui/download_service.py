@@ -23,6 +23,7 @@ import collections
 import logging
 import threading
 import traceback
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -45,7 +46,7 @@ from haberlea.utils.progress import (
 from haberlea.utils.settings import settings
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import AsyncGenerator, Callable, Mapping
 
     from haberlea.core.haberlea import Haberlea
     from haberlea.download_queue import DownloadJob, DownloadQueue
@@ -122,6 +123,24 @@ class JobSnapshot(msgspec.Struct, frozen=True, kw_only=True):
     track_ids: tuple[str, ...] = ()
 
 
+class AuthPromptSnapshot(msgspec.Struct, frozen=True, kw_only=True):
+    """Immutable view of an active interactive-login prompt.
+
+    Attributes:
+        prompt_id: Unique identifier used to resolve the prompt.
+        kind: "input" when the user must submit a value, "waiting" when the
+            front-end should display a link plus a waiting indicator while a
+            background flow (e.g. TIDAL device authorization) polls.
+        message: Human-readable instructions for the user.
+        url: Optional link the user must open; empty when not applicable.
+    """
+
+    prompt_id: int
+    kind: str
+    message: str
+    url: str = ""
+
+
 class ServiceSnapshot(msgspec.Struct, frozen=True, kw_only=True):
     """Immutable top-level service state.
 
@@ -131,6 +150,8 @@ class ServiceSnapshot(msgspec.Struct, frozen=True, kw_only=True):
         is_downloading: True when the worker holds an active batch.
         pending_batches: URL batches waiting for the worker.
         logs_tail: Last ``_LOG_TAIL_LIMIT`` log lines.
+        auth_prompt: The active interactive-login prompt, if any. At most one
+            is active because the worker logs in serially, in-band.
         revision: Monotonic counter bumped on every reducer output.
     """
 
@@ -141,6 +162,7 @@ class ServiceSnapshot(msgspec.Struct, frozen=True, kw_only=True):
     is_downloading: bool = False
     pending_batches: tuple[tuple[str, ...], ...] = ()
     logs_tail: tuple[str, ...] = ()
+    auth_prompt: AuthPromptSnapshot | None = None
     revision: int = 0
 
 
@@ -203,6 +225,21 @@ class BatchFinishedEvent(msgspec.Struct, frozen=True, kw_only=True):
 
 class ClearCompletedEvent(msgspec.Struct, frozen=True, kw_only=True):
     """Drop all terminal jobs and their tracks."""
+
+
+class AuthPromptEvent(msgspec.Struct, frozen=True, kw_only=True):
+    """Publish an interactive-login prompt to the snapshot."""
+
+    prompt_id: int
+    kind: str
+    message: str
+    url: str = ""
+
+
+class AuthPromptClearedEvent(msgspec.Struct, frozen=True, kw_only=True):
+    """Clear the active prompt once it has been resolved or abandoned."""
+
+    prompt_id: int
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +584,43 @@ def apply_clear_completed(
     return _bump(s, jobs=tuple(kept_jobs), tracks=_freeze_tracks(new_tracks))
 
 
+def apply_auth_prompt(s: ServiceSnapshot, e: AuthPromptEvent) -> ServiceSnapshot:
+    """Set the active interactive-login prompt.
+
+    Args:
+        s: The current snapshot.
+        e: The auth-prompt event.
+
+    Returns:
+        A new snapshot exposing the prompt.
+    """
+    prompt = AuthPromptSnapshot(
+        prompt_id=e.prompt_id,
+        kind=e.kind,
+        message=e.message,
+        url=e.url,
+    )
+    return _bump(s, auth_prompt=prompt)
+
+
+def apply_auth_prompt_cleared(
+    s: ServiceSnapshot, e: AuthPromptClearedEvent
+) -> ServiceSnapshot:
+    """Clear the active prompt when its id matches.
+
+    Args:
+        s: The current snapshot.
+        e: The auth-prompt-cleared event.
+
+    Returns:
+        A new snapshot with no active prompt, or the input snapshot when the
+        id does not match the current prompt (a stale clear).
+    """
+    if s.auth_prompt is None or s.auth_prompt.prompt_id != e.prompt_id:
+        return s
+    return _bump(s, auth_prompt=None)
+
+
 def reduce(s: ServiceSnapshot, event: object) -> ServiceSnapshot:
     """Dispatch an event to its reducer.
 
@@ -573,6 +647,10 @@ def reduce(s: ServiceSnapshot, event: object) -> ServiceSnapshot:
         return apply_batch_finished(s, event)
     if isinstance(event, ClearCompletedEvent):
         return apply_clear_completed(s, event)
+    if isinstance(event, AuthPromptEvent):
+        return apply_auth_prompt(s, event)
+    if isinstance(event, AuthPromptClearedEvent):
+        return apply_auth_prompt_cleared(s, event)
     logger.warning("Unknown event type: %r", type(event).__name__)
     return s
 
@@ -648,6 +726,22 @@ def build_queue_ready_from_queue(queue: DownloadQueue) -> QueueReadyEvent:
 # ---------------------------------------------------------------------------
 
 
+class _PromptWaiter:
+    """Mutable rendezvous for a single interactive-login prompt.
+
+    A worker coroutine awaits :attr:`event`; the UI command ``resolve_prompt``
+    stores :attr:`value` and sets the event to wake the worker. Intentionally
+    mutable — it is the rendezvous primitive at the I/O boundary.
+    """
+
+    __slots__ = ("event", "value")
+
+    def __init__(self) -> None:
+        """Initialize an unresolved waiter with an empty value."""
+        self.event: anyio.Event = anyio.Event()
+        self.value: str = ""
+
+
 class Subscriber(msgspec.Struct, frozen=True, kw_only=True):
     """A registered subscriber.
 
@@ -678,6 +772,12 @@ _initialized: bool = False
 _sub_lock: threading.Lock = threading.Lock()
 _subscribers: dict[int, Subscriber] = {}
 _next_sub_id: int = 0
+
+# Interactive-login prompt registry. Guarded by ``_state_lock`` (allocation
+# and removal); ``anyio.Event`` resolution happens on the same event loop the
+# worker and UI handlers run on. This is part of the single mutation boundary.
+_prompt_waiters: dict[int, _PromptWaiter] = {}
+_next_prompt_id: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -795,6 +895,115 @@ async def submit_urls(urls: tuple[str, ...]) -> None:
 async def clear_completed() -> None:
     """Drop all jobs in a terminal status and their tracks."""
     await _apply_event(ClearCompletedEvent())
+
+
+async def resolve_prompt(prompt_id: int, value: str) -> None:
+    """Resolve an active interactive-login prompt with the user's input.
+
+    Wakes the worker coroutine awaiting the prompt. A no-op if the prompt is
+    unknown (already resolved or cancelled).
+
+    Args:
+        prompt_id: Identifier of the prompt to resolve.
+        value: The value entered by the user (e.g. a callback URL).
+    """
+    async with _state_lock:
+        waiter = _prompt_waiters.get(prompt_id)
+        if waiter is None:
+            return
+        waiter.value = value
+        waiter.event.set()
+
+
+# ---------------------------------------------------------------------------
+# Interactive-login prompter (WebUI implementation of AuthPrompter)
+# ---------------------------------------------------------------------------
+
+
+async def _open_prompt(*, kind: str, message: str, url: str) -> int:
+    """Register a waiter and publish the prompt to the snapshot.
+
+    Args:
+        kind: "input" or "waiting".
+        message: Instructions shown to the user.
+        url: Optional link to display.
+
+    Returns:
+        The allocated prompt id.
+    """
+    global _next_prompt_id
+    async with _state_lock:
+        _next_prompt_id += 1
+        prompt_id = _next_prompt_id
+        _prompt_waiters[prompt_id] = _PromptWaiter()
+    await _apply_event(
+        AuthPromptEvent(prompt_id=prompt_id, kind=kind, message=message, url=url)
+    )
+    return prompt_id
+
+
+async def _close_prompt(prompt_id: int) -> None:
+    """Remove the waiter and clear the prompt from the snapshot.
+
+    Args:
+        prompt_id: Identifier of the prompt to close.
+    """
+    async with _state_lock:
+        _prompt_waiters.pop(prompt_id, None)
+    await _apply_event(AuthPromptClearedEvent(prompt_id=prompt_id))
+
+
+class WebUiAuthPrompter:
+    """``AuthPrompter`` that surfaces prompts through the service snapshot.
+
+    Each prompt is published as an immutable ``AuthPromptEvent`` and resolved
+    by the ``resolve_prompt`` command once the user responds in the UI.
+    """
+
+    async def request_input(self, prompt: str, *, url: str = "") -> str:
+        """Publish an input prompt and await the user's response.
+
+        Args:
+            prompt: Instructions shown to the user.
+            url: Optional link displayed alongside the input field.
+
+        Returns:
+            The value submitted by the user, or "" if abandoned.
+        """
+        prompt_id = await _open_prompt(kind="input", message=prompt, url=url)
+        waiter = _prompt_waiters.get(prompt_id)
+        try:
+            if waiter is None:
+                return ""
+            await waiter.event.wait()
+            return waiter.value
+        finally:
+            await _close_prompt(prompt_id)
+
+    async def notify(self, message: str) -> None:
+        """Surface an informational status message in the log tail.
+
+        Args:
+            message: The message to display.
+        """
+        await _apply_event(LogEvent(line=message))
+
+    @asynccontextmanager
+    async def waiting(self, message: str, url: str) -> AsyncGenerator[None]:
+        """Display a link plus waiting indicator while the block runs.
+
+        Args:
+            message: Instructions shown alongside the link.
+            url: The link the user must open to authorize.
+
+        Yields:
+            None — control returns to the wrapped polling block.
+        """
+        prompt_id = await _open_prompt(kind="waiting", message=message, url=url)
+        try:
+            yield
+        finally:
+            await _close_prompt(prompt_id)
 
 
 # ---------------------------------------------------------------------------
