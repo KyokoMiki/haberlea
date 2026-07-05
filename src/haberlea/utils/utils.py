@@ -620,7 +620,7 @@ def read_temporary_setting(
         temporary_settings, module, global_mode, session_name, create_if_missing=True
     )
 
-    if session and root_setting:
+    if session is not None and root_setting:
         if setting:
             return (
                 session[root_setting][setting]
@@ -629,7 +629,7 @@ def read_temporary_setting(
             )
         else:
             return session.get(root_setting, None)
-    elif root_setting and not session:
+    elif root_setting and session is None:
         raise TemporarySettingsError(module)
     else:
         return session
@@ -666,7 +666,7 @@ def set_temporary_setting(
         temporary_settings, module, global_mode, session_name, create_if_missing=True
     )
 
-    if not session:
+    if session is None:
         raise TemporarySettingsError(module)
     if setting:
         if root_setting not in session:
