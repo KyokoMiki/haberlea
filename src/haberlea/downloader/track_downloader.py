@@ -464,7 +464,9 @@ class TrackDownloader:
 
         if is_single_track_download:
             if self._formatting.force_album_format:
-                album_info = await task.module.get_album_info(track_info.album_id)
+                album_info = await task.module.get_album_info(
+                    track_info.album_id, data=track_info.download_data
+                )
                 if album_info:
                     download_location = self._path_builder.build_album_path(
                         track_info.album_id, album_info
