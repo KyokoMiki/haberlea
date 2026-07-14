@@ -207,6 +207,7 @@ async def _queue_media_item(
     media_type = media.media_type
     media_id = media.media_id
     module_name = module_ref.name
+    url_data = {"url_region": media.url_region} if media.url_region else None
 
     custom_module_ref = None
 
@@ -228,6 +229,7 @@ async def _queue_media_item(
                         module=module_ref,
                         album_id=media_id,
                         original_url=media.original_url,
+                        album_data=url_data,
                     )
                 )
             case DownloadTypeEnum.track:
@@ -236,6 +238,7 @@ async def _queue_media_item(
                         module=module_ref,
                         track_id=media_id,
                         original_url=media.original_url,
+                        track_data=url_data,
                     )
                 )
             case DownloadTypeEnum.playlist:
@@ -253,6 +256,7 @@ async def _queue_media_item(
                         module=module_ref,
                         video_id=media_id,
                         original_url=media.original_url,
+                        video_data=url_data,
                     )
                 )
             case DownloadTypeEnum.artist:
