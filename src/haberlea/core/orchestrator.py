@@ -178,16 +178,21 @@ async def _queue_module_items(
     if ModuleModes.download not in supported_modes:
         raise ModuleDoesNotSupportAbility(module_name, "track downloading")
 
-    # Select preferred account based on URL region
+    # Select preferred account based on URL region, falling back to
+    # other accounts when the preferred one fails to load (e.g. login error)
     accounts = ctx.session.get_module_accounts(module_name)
     url_region = items[0].url_region if items else ""
     preferred_index = find_preferred_account_index(accounts, url_region)
 
-    module = await ctx.session.load_module(module_name, preferred_index)
-    module_ref = ModuleRef(name=module_name, instance=module)
+    module_with_account = await ctx.session.load_module_with_fallback(
+        module_name, preferred_index
+    )
+    module_ref = ModuleRef(name=module_name, instance=module_with_account.module)
 
     for media in items:
-        await _queue_media_item(ctx, module_ref, media, account_index=preferred_index)
+        await _queue_media_item(
+            ctx, module_ref, media, account_index=module_with_account.account_index
+        )
 
 
 async def _queue_media_item(

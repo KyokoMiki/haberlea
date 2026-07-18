@@ -213,7 +213,6 @@ class ModuleRegistry:
 
         controller = self._build_module_controller(module, account_index)
         loaded_module = module_class(controller)
-        self.state.loaded_modules[cache_key] = loaded_module
 
         module_info = self.state.module_settings[module]
         accounts = settings.modules.get(module, [])
@@ -221,15 +220,21 @@ class ModuleRegistry:
             accounts[account_index] if account_index < len(accounts) else {}
         )
 
-        await self._session_manager.handle_module_auth(
-            LoginContext(
-                module_name=module,
-                loaded_module=loaded_module,
-                module_info=module_info,
-                account_settings=account_settings,
-                account_index=account_index,
-            ),
-        )
+        try:
+            await self._session_manager.handle_module_auth(
+                LoginContext(
+                    module_name=module,
+                    loaded_module=loaded_module,
+                    module_info=module_info,
+                    account_settings=account_settings,
+                    account_index=account_index,
+                ),
+            )
+        except Exception:
+            await loaded_module.close()
+            raise
+
+        self.state.loaded_modules[cache_key] = loaded_module
         self._ensure_module_data_folder(module)
 
         logger.debug("Module loaded: %s (account %d)", module, account_index)
