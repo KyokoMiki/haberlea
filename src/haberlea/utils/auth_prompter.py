@@ -111,10 +111,7 @@ class CliAuthPrompter:
         Returns:
             The entered line, stripped of surrounding whitespace.
         """
-        if url:
-            full_prompt = f"{prompt}\n\n    {url}\n\n> "
-        else:
-            full_prompt = f"{prompt}\n> "
+        full_prompt = f"{prompt}\n\n    {url}\n\n> " if url else f"{prompt}\n> "
         return await run_sync(_blocking_input, full_prompt)
 
     async def notify(self, message: str) -> None:

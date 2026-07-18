@@ -813,7 +813,8 @@ def clean_command(yes: bool) -> None:
             errors.append(f"{entry}: {e}")
 
     click.echo(
-        f"Cleaned {temp_dir}: {removed_files} files, {removed_dirs} directories removed."
+        f"Cleaned {temp_dir}: {removed_files} files, "
+        f"{removed_dirs} directories removed."
     )
     if errors:
         click.echo(f"Failed to remove {len(errors)} entries:", err=True)

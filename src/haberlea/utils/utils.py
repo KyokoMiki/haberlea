@@ -12,6 +12,7 @@ import operator
 import re
 import shutil
 import zipfile
+from asyncio import IncompleteReadError
 from collections.abc import Callable, Sequence
 from functools import reduce
 from pathlib import Path
@@ -204,18 +205,28 @@ async def _download_once(
 
         async with await anyio.open_file(str(file_location), "wb") as f:
             chunk_index = 0
-            async for chunk in response.content.iter_chunked(config.chunk_size):
-                if chunk:
-                    original_len = len(chunk)
-                    if config.chunk_processor:
-                        # Run CPU-intensive decryption in thread pool
-                        chunk = await asyncify(config.chunk_processor)(
-                            chunk, chunk_index
-                        )
-                    await f.write(chunk)
-                    chunk_index += 1
-                    if config.task_id and total > 0:
-                        await advance(config.task_id, original_len, total)
+            reader = response.content
+            while True:
+                # Read exactly chunk_size bytes so that a chunk_processor
+                # relying on fixed, aligned boundaries (e.g. block-cipher
+                # stripe decryption) always receives whole chunks. Only the
+                # final chunk (in IncompleteReadError.partial) is smaller.
+                try:
+                    chunk = await reader.readexactly(config.chunk_size)
+                except IncompleteReadError as e:
+                    chunk = e.partial
+                if not chunk:
+                    break
+                original_len = len(chunk)
+                if config.chunk_processor:
+                    # Run CPU-intensive decryption in thread pool
+                    chunk = await asyncify(config.chunk_processor)(chunk, chunk_index)
+                await f.write(chunk)
+                chunk_index += 1
+                if config.task_id and total > 0:
+                    await advance(config.task_id, original_len, total)
+                if original_len < config.chunk_size:
+                    break
 
 
 async def download_file(

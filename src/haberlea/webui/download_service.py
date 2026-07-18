@@ -621,6 +621,21 @@ def apply_auth_prompt_cleared(
     return _bump(s, auth_prompt=None)
 
 
+# Event type to reducer mapping
+_EVENT_REDUCERS: dict[type, Callable[[ServiceSnapshot, Any], ServiceSnapshot]] = {
+    TrackEvent: apply_track_event,
+    QueueReadyEvent: apply_queue_ready,
+    JobFinishedEvent: apply_job_finished,
+    LogEvent: apply_log,
+    BatchQueuedEvent: apply_batch_queued,
+    BatchStartedEvent: apply_batch_started,
+    BatchFinishedEvent: apply_batch_finished,
+    ClearCompletedEvent: apply_clear_completed,
+    AuthPromptEvent: apply_auth_prompt,
+    AuthPromptClearedEvent: apply_auth_prompt_cleared,
+}
+
+
 def reduce(s: ServiceSnapshot, event: object) -> ServiceSnapshot:
     """Dispatch an event to its reducer.
 
@@ -631,27 +646,11 @@ def reduce(s: ServiceSnapshot, event: object) -> ServiceSnapshot:
     Returns:
         The new snapshot, or the input snapshot if the event is unknown.
     """
-    if isinstance(event, TrackEvent):
-        return apply_track_event(s, event)
-    if isinstance(event, QueueReadyEvent):
-        return apply_queue_ready(s, event)
-    if isinstance(event, JobFinishedEvent):
-        return apply_job_finished(s, event)
-    if isinstance(event, LogEvent):
-        return apply_log(s, event)
-    if isinstance(event, BatchQueuedEvent):
-        return apply_batch_queued(s, event)
-    if isinstance(event, BatchStartedEvent):
-        return apply_batch_started(s, event)
-    if isinstance(event, BatchFinishedEvent):
-        return apply_batch_finished(s, event)
-    if isinstance(event, ClearCompletedEvent):
-        return apply_clear_completed(s, event)
-    if isinstance(event, AuthPromptEvent):
-        return apply_auth_prompt(s, event)
-    if isinstance(event, AuthPromptClearedEvent):
-        return apply_auth_prompt_cleared(s, event)
-    logger.warning("Unknown event type: %r", type(event).__name__)
+    event_type = type(event)
+    reducer = _EVENT_REDUCERS.get(event_type)
+    if reducer is not None:
+        return reducer(s, event)
+    logger.warning("Unknown event type: %r", event_type.__name__)
     return s
 
 
