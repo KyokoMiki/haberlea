@@ -200,6 +200,7 @@ async def _queue_media_item(
     module_ref: ModuleRef,
     media: MediaIdentification,
     account_index: int = 0,
+    first_account_index: int | None = None,
 ) -> None:
     """Queues a single media item with multi-account fallback.
 
@@ -208,7 +209,10 @@ async def _queue_media_item(
         module_ref: Module name and loaded instance.
         media: The media item to queue.
         account_index: Current account index being used.
+        first_account_index: Account index the fallback chain started from.
     """
+    if first_account_index is None:
+        first_account_index = account_index
     media_type = media.media_type
     media_id = media.media_id
     module_name = module_ref.name
@@ -282,7 +286,9 @@ async def _queue_media_item(
         account_count = ctx.session.module_registry.get_module_account_count(
             module_name
         )
-        next_account = _find_next_account(account_index, account_count)
+        next_account = _find_next_account(
+            account_index, account_count, first_account_index
+        )
 
         if next_account is None:
             raise
@@ -304,23 +310,32 @@ async def _queue_media_item(
 
         new_module = await ctx.session.load_module(module_name, next_account)
         new_module_ref = ModuleRef(name=module_name, instance=new_module)
-        await _queue_media_item(ctx, new_module_ref, media, account_index=next_account)
+        await _queue_media_item(
+            ctx,
+            new_module_ref,
+            media,
+            account_index=next_account,
+            first_account_index=first_account_index,
+        )
 
 
-def _find_next_account(current: int, total: int) -> int | None:
-    """Finds the next account index to try.
+def _find_next_account(current: int, total: int, start: int) -> int | None:
+    """Finds the next account index to try, wrapping around.
 
     Args:
         current: Current account index.
         total: Total number of accounts.
+        start: Account index the fallback chain started from.
 
     Returns:
-        Next account index, or None if no more accounts.
+        Next account index, or None once all accounts have been tried.
     """
-    next_idx = current + 1
-    if next_idx < total:
-        return next_idx
-    return None
+    if total <= 1:
+        return None
+    next_idx = (current + 1) % total
+    if next_idx == start:
+        return None
+    return next_idx
 
 
 async def _validate_third_party_modules(
