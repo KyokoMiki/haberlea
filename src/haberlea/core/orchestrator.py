@@ -283,23 +283,14 @@ async def _queue_media_item(
                     value=media_type,
                 )
     except RegionRestrictedError:
-        account_count = ctx.session.module_registry.get_module_account_count(
-            module_name
+        fallback = await _load_next_available_account(
+            ctx, module_name, account_index, first_account_index
         )
-        next_account = _find_next_account(
-            account_index, account_count, first_account_index
-        )
-
-        if next_account is None:
+        if fallback is None:
             raise
 
-        logger.warning(
-            "Region restricted for %s %s with account %d, trying account %d",
-            media_type.value,
-            media_id,
-            account_index,
-            next_account,
-        )
+        next_account, new_module_ref = fallback
+
         logger.warning(
             "Account %d region restricted for %s %s, switching to account %d...",
             account_index,
@@ -308,8 +299,6 @@ async def _queue_media_item(
             next_account,
         )
 
-        new_module = await ctx.session.load_module(module_name, next_account)
-        new_module_ref = ModuleRef(name=module_name, instance=new_module)
         await _queue_media_item(
             ctx,
             new_module_ref,
@@ -317,6 +306,44 @@ async def _queue_media_item(
             account_index=next_account,
             first_account_index=first_account_index,
         )
+
+
+async def _load_next_available_account(
+    ctx: QueueingContext,
+    module_name: str,
+    account_index: int,
+    first_account_index: int,
+) -> tuple[int, ModuleRef] | None:
+    """Loads the next account that can be initialized, skipping failures.
+
+    Args:
+        ctx: Queueing context with session, downloader, and separate_download_module.
+        module_name: The module name.
+        account_index: Current account index being used.
+        first_account_index: Account index the fallback chain started from.
+
+    Returns:
+        Tuple of (account index, module ref), or None if no account is usable.
+    """
+    account_count = ctx.session.module_registry.get_module_account_count(module_name)
+    next_account = _find_next_account(account_index, account_count, first_account_index)
+
+    while next_account is not None:
+        try:
+            module = await ctx.session.load_module(module_name, next_account)
+            return next_account, ModuleRef(name=module_name, instance=module)
+        except Exception as e:
+            logger.warning(
+                "Failed to load module %s with account %d: %s, skipping...",
+                module_name,
+                next_account,
+                e,
+            )
+            next_account = _find_next_account(
+                next_account, account_count, first_account_index
+            )
+
+    return None
 
 
 def _find_next_account(current: int, total: int, start: int) -> int | None:
