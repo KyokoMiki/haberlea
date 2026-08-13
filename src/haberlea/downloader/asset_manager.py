@@ -212,17 +212,23 @@ class AssetManager:
         lyrics_info = LyricsInfo()
         third_party = self._third_party_modules.get(ModuleModes.lyrics)
 
-        if third_party and third_party != module_name:
-            results = await self._search_by_tags(third_party, track_info)
-            if results:
-                tp_module = await self._get_module_by_name(third_party)
-                lyrics_info = await tp_module.get_track_lyrics(
-                    results[0].result_id, data=results[0].data
+        try:
+            if third_party and third_party != module_name:
+                results = await self._search_by_tags(third_party, track_info)
+                if results:
+                    tp_module = await self._get_module_by_name(third_party)
+                    lyrics_info = await tp_module.get_track_lyrics(
+                        results[0].result_id, data=results[0].data
+                    )
+            elif self._modules.supports_mode(module_name, ModuleModes.lyrics):
+                lyrics_info = await module.get_track_lyrics(
+                    ctx.task.track_id, data=track_info.lyrics_data
                 )
-        elif self._modules.supports_mode(module_name, ModuleModes.lyrics):
-            lyrics_info = await module.get_track_lyrics(
-                ctx.task.track_id, data=track_info.lyrics_data
+        except Exception:
+            logger.warning(
+                "Failed to fetch lyrics for track %s", ctx.task.track_id, exc_info=True
             )
+            return LyricsResult(embedded="", synced=None)
 
         embedded = ""
         if lyrics_info.embedded and lc.embed_lyrics:
